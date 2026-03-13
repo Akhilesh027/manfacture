@@ -1,4 +1,4 @@
-// src/pages/Catalogue.tsx
+// src/pages/Catalogue.tsx – updated for multiple sizes and multiple colors
 import { useEffect, useMemo, useState } from "react";
 import { Helmet } from "react-helmet-async";
 import DashboardLayout from "@/components/layout/DashboardLayout";
@@ -29,8 +29,10 @@ import {
   RefreshCcw,
   Save,
   AlertTriangle,
+  Check,
 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
 
 interface Product {
   _id: string;
@@ -47,9 +49,11 @@ interface Product {
   lowStockThreshold?: number;
   availability: "In Stock" | "Out of Stock" | "Low Stock";
 
-  color: string; // hex
+  // 👇 changed to array
+  color: string[]; // hex values
   material: string;
-  size: string;
+  // 👇 changed to array
+  size: string[];
   weight: string;
   location: string;
   deliveryTime?: string;
@@ -86,11 +90,17 @@ const colors = [
   { name: "Blue", value: "#2C3E50" },
 ];
 
-const colorName = (hex?: string) =>
-  colors.find((c) => c.value.toLowerCase() === (hex || "").toLowerCase())
-    ?.name ||
-  hex ||
-  "N/A";
+// helper to display color names from hex array
+const colorNames = (hexArray?: string[]) => {
+  if (!hexArray || hexArray.length === 0) return "N/A";
+  return hexArray
+    .map(
+      (hex) =>
+        colors.find((c) => c.value.toLowerCase() === hex.toLowerCase())?.name ||
+        hex
+    )
+    .join(", ");
+};
 
 // ✅ inventory-safe availability
 const computeAvailability = (qty: number, low = 5) => {
@@ -274,13 +284,36 @@ export default function Catalogue() {
       const data = await apiRequest("GET", "/api/products");
       const list = (data.products || []) as Product[];
 
-      // ✅ enforce safe availability display from quantity
+      // ✅ enforce safe availability display from quantity and normalise size & color
       const normalized = list.map((p) => {
         const low = p.lowStockThreshold ?? 5;
+        
+        // ensure size is always an array
+        let sizeArray: string[];
+        if (Array.isArray(p.size)) {
+          sizeArray = p.size;
+        } else if (typeof p.size === "string" && p.size) {
+          sizeArray = [p.size];
+        } else {
+          sizeArray = [];
+        }
+
+        // ensure color is always an array
+        let colorArray: string[];
+        if (Array.isArray(p.color)) {
+          colorArray = p.color;
+        } else if (typeof p.color === "string" && p.color) {
+          colorArray = [p.color];
+        } else {
+          colorArray = [];
+        }
+
         return {
           ...p,
           lowStockThreshold: low,
           availability: computeAvailability(p.quantity ?? 0, low),
+          size: sizeArray,
+          color: colorArray,
         };
       });
 
@@ -319,8 +352,10 @@ export default function Catalogue() {
     quantity: "",
     lowStockThreshold: "5",
 
-    color: "",
+    // 👇 will be stored as array, but form uses checkboxes
+    color: [] as string[],
     material: "",
+    // 👇 size input will be comma-separated string
     size: "",
     weight: "",
     location: "",
@@ -367,7 +402,14 @@ export default function Catalogue() {
             .toLowerCase()
             .includes(s) ||
           (p.sku || "").toLowerCase().includes(s) ||
-          (p.description || "").toLowerCase().includes(s),
+          (p.description || "").toLowerCase().includes(s) ||
+          // search in sizes
+          (Array.isArray(p.size) && p.size.some(sz => sz.toLowerCase().includes(s))) ||
+          // search in color names
+          (Array.isArray(p.color) && p.color.some(col => {
+            const colName = colors.find(c => c.value.toLowerCase() === col.toLowerCase())?.name.toLowerCase();
+            return colName?.includes(s);
+          }))
       );
     }
 
@@ -648,6 +690,11 @@ export default function Catalogue() {
         ? parseInt(newProduct.lowStockThreshold, 10)
         : 5;
 
+      // Convert size string to array (split by comma)
+      const sizeArray = newProduct.size
+        ? newProduct.size.split(",").map(s => s.trim()).filter(Boolean)
+        : [];
+
       const productData = {
         name: newProduct.name,
 
@@ -667,9 +714,10 @@ export default function Catalogue() {
         // availability ignored by backend (safe)
         availability: computeAvailability(qty, low),
 
+        // 👇 send as arrays
         color: newProduct.color,
         material: newProduct.material,
-        size: newProduct.size,
+        size: sizeArray,
         weight: newProduct.weight,
         location: newProduct.location,
         deliveryTime: newProduct.deliveryTime,
@@ -685,6 +733,9 @@ export default function Catalogue() {
         ...created,
         lowStockThreshold: created.lowStockThreshold ?? low,
         availability: computeAvailability(created.quantity ?? 0, created.lowStockThreshold ?? low),
+        // ensure arrays
+        color: Array.isArray(created.color) ? created.color : (created.color ? [created.color] : []),
+        size: Array.isArray(created.size) ? created.size : (created.size ? [created.size] : []),
       };
 
       const next = [createdNormalized, ...products];
@@ -705,7 +756,7 @@ export default function Catalogue() {
         price: "",
         quantity: "",
         lowStockThreshold: "5",
-        color: "",
+        color: [],
         material: "",
         size: "",
         weight: "",
@@ -798,6 +849,9 @@ export default function Catalogue() {
       const low = Number(editProduct.lowStockThreshold ?? 5);
       const availability = computeAvailability(qty, low);
 
+      // For size, it's already an array on editProduct; we keep as is
+      // For color, it's already an array
+
       const updateData: Partial<Product> & any = {
         name: editProduct.name,
 
@@ -834,6 +888,9 @@ export default function Catalogue() {
         ...updated,
         lowStockThreshold: updated.lowStockThreshold ?? low,
         availability: computeAvailability(updated.quantity ?? 0, updated.lowStockThreshold ?? low),
+        // ensure arrays
+        color: Array.isArray(updated.color) ? updated.color : (updated.color ? [updated.color] : []),
+        size: Array.isArray(updated.size) ? updated.size : (updated.size ? [updated.size] : []),
       };
 
       const updatedProducts = products.map((p) =>
@@ -1206,32 +1263,53 @@ export default function Catalogue() {
 
                   {/* Right */}
                   <div className="space-y-3">
+                    {/* 👇 Color multi-select checkboxes */}
                     <div>
-                      <Label className="text-gray-300">Color</Label>
-                      <div className="flex items-center gap-3">
-                        <select
-                          value={newProduct.color}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, color: e.target.value })
-                          }
-                          disabled={saving}
-                          className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
-                          focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
-                        >
-                          <option value="">Select Color</option>
-                          {colors.map((c) => (
-                            <option key={c.value} value={c.value}>
-                              {c.name}
-                            </option>
-                          ))}
-                        </select>
-
-                        <div
-                          className="h-10 w-10 rounded-md border border-gray-700"
-                          style={{ backgroundColor: newProduct.color || "transparent" }}
-                          title={newProduct.color || "No color"}
-                        />
+                      <Label className="text-gray-300">Colors</Label>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        {colors.map((colorOption) => {
+                          const isSelected = newProduct.color.includes(colorOption.value);
+                          return (
+                            <label
+                              key={colorOption.value}
+                              className={cn(
+                                "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+                                isSelected
+                                  ? "border-yellow-500 bg-yellow-500/10"
+                                  : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+                              )}
+                            >
+                              <input
+                                type="checkbox"
+                                className="sr-only"
+                                checked={isSelected}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setNewProduct((prev) => ({
+                                      ...prev,
+                                      color: [...prev.color, colorOption.value],
+                                    }));
+                                  } else {
+                                    setNewProduct((prev) => ({
+                                      ...prev,
+                                      color: prev.color.filter((c) => c !== colorOption.value),
+                                    }));
+                                  }
+                                }}
+                              />
+                              <div
+                                className="w-4 h-4 rounded-full border border-gray-600"
+                                style={{ backgroundColor: colorOption.value }}
+                              />
+                              <span className="text-sm text-white">{colorOption.name}</span>
+                              {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+                            </label>
+                          );
+                        })}
                       </div>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Selected: {newProduct.color.length} color(s)
+                      </p>
                     </div>
 
                     <div>
@@ -1246,18 +1324,24 @@ export default function Catalogue() {
                       />
                     </div>
 
+                    {/* 👇 Size input (comma-separated) */}
+                    <div>
+                      <Label className="text-gray-300">Sizes (comma separated)</Label>
+                      <Input
+                        value={newProduct.size}
+                        onChange={(e) =>
+                          setNewProduct({ ...newProduct, size: e.target.value })
+                        }
+                        placeholder="e.g. S, M, L, XL"
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
+                      <p className="text-xs text-gray-400 mt-1">
+                        Enter sizes separated by commas
+                      </p>
+                    </div>
+
                     <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label className="text-gray-300">Size</Label>
-                        <Input
-                          value={newProduct.size}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, size: e.target.value })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
                       <div>
                         <Label className="text-gray-300">Weight</Label>
                         <Input
@@ -1269,18 +1353,17 @@ export default function Catalogue() {
                           className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
                         />
                       </div>
-                    </div>
-
-                    <div>
-                      <Label className="text-gray-300">Location</Label>
-                      <Input
-                        value={newProduct.location}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, location: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
+                      <div>
+                        <Label className="text-gray-300">Location</Label>
+                        <Input
+                          value={newProduct.location}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, location: e.target.value })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
                     </div>
 
                     <div>
@@ -1398,7 +1481,7 @@ export default function Catalogue() {
             <div className="relative flex-1">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
               <Input
-                placeholder="Search products by name, category, SKU..."
+                placeholder="Search products by name, category, SKU, size, color..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-10 bg-gray-900 border-gray-800 text-white focus:border-yellow-500"
@@ -1534,7 +1617,7 @@ export default function Catalogue() {
                           </Badge>
                         </div>
 
-                        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
                           <div className="bg-gray-800/50 p-3 rounded-lg">
                             <p className="text-xs text-gray-400 mb-1">Price</p>
                             <p className="font-semibold text-yellow-400">
@@ -1550,9 +1633,16 @@ export default function Catalogue() {
                           </div>
 
                           <div className="bg-gray-800/50 p-3 rounded-lg">
-                            <p className="text-xs text-gray-400 mb-1">Low Stock</p>
-                            <p className="font-semibold text-white">
-                              {product.lowStockThreshold ?? 5}
+                            <p className="text-xs text-gray-400 mb-1">Colors</p>
+                            <p className="font-semibold text-white truncate" title={colorNames(product.color)}>
+                              {colorNames(product.color)}
+                            </p>
+                          </div>
+
+                          <div className="bg-gray-800/50 p-3 rounded-lg">
+                            <p className="text-xs text-gray-400 mb-1">Sizes</p>
+                            <p className="font-semibold text-white truncate" title={product.size?.join(", ")}>
+                              {product.size?.join(", ") || "N/A"}
                             </p>
                           </div>
                         </div>
@@ -1756,21 +1846,21 @@ export default function Catalogue() {
                         </p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
-                        <p className="text-sm text-gray-400 mb-1">Color</p>
+                        <p className="text-sm text-gray-400 mb-1">Colors</p>
                         <p className="font-semibold text-white">
-                          {colorName(viewProduct.color)}
+                          {colorNames(viewProduct.color)}
+                        </p>
+                      </div>
+                      <div className="bg-gray-800 p-3 rounded-lg">
+                        <p className="text-sm text-gray-400 mb-1">Sizes</p>
+                        <p className="font-semibold text-white">
+                          {viewProduct.size?.join(", ") || "N/A"}
                         </p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Material</p>
                         <p className="font-semibold text-white">
                           {viewProduct.material || "N/A"}
-                        </p>
-                      </div>
-                      <div className="bg-gray-800 p-3 rounded-lg">
-                        <p className="text-sm text-gray-400 mb-1">Size</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.size || "N/A"}
                         </p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
@@ -1833,7 +1923,7 @@ export default function Catalogue() {
           </DialogContent>
         </Dialog>
 
-        {/* Edit Modal (keep as your existing, but with lowStockThreshold + no availability dropdown) */}
+        {/* Edit Modal */}
         <Dialog
           open={!!editProduct}
           onOpenChange={(open) => {
@@ -2025,32 +2115,57 @@ export default function Catalogue() {
 
                   {/* Right */}
                   <div className="space-y-3">
+                    {/* 👇 Color multi-select checkboxes for edit */}
                     <div>
-                      <Label className="text-gray-300">Color</Label>
-                      <div className="flex items-center gap-3">
-                        <select
-                          value={editProduct.color || ""}
-                          onChange={(e) =>
-                            setEditProduct({ ...editProduct, color: e.target.value })
-                          }
-                          disabled={saving}
-                          className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
-                          focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
-                        >
-                          <option value="">Select Color</option>
-                          {colors.map((c) => (
-                            <option key={c.value} value={c.value}>
-                              {c.name}
-                            </option>
-                          ))}
-                        </select>
-
-                        <div
-                          className="h-10 w-10 rounded-md border border-gray-700"
-                          style={{ backgroundColor: editProduct.color || "transparent" }}
-                          title={editProduct.color || "No color"}
-                        />
+                      <Label className="text-gray-300">Colors</Label>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        {colors.map((colorOption) => {
+                          const isSelected = editProduct.color?.includes(colorOption.value) || false;
+                          return (
+                            <label
+                              key={colorOption.value}
+                              className={cn(
+                                "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+                                isSelected
+                                  ? "border-yellow-500 bg-yellow-500/10"
+                                  : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+                              )}
+                            >
+                              <input
+                                type="checkbox"
+                                className="sr-only"
+                                checked={isSelected}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setEditProduct((prev) =>
+                                      prev ? {
+                                        ...prev,
+                                        color: [...(prev.color || []), colorOption.value],
+                                      } : prev
+                                    );
+                                  } else {
+                                    setEditProduct((prev) =>
+                                      prev ? {
+                                        ...prev,
+                                        color: (prev.color || []).filter((c) => c !== colorOption.value),
+                                      } : prev
+                                    );
+                                  }
+                                }}
+                              />
+                              <div
+                                className="w-4 h-4 rounded-full border border-gray-600"
+                                style={{ backgroundColor: colorOption.value }}
+                              />
+                              <span className="text-sm text-white">{colorOption.name}</span>
+                              {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+                            </label>
+                          );
+                        })}
                       </div>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Selected: {editProduct.color?.length || 0} color(s)
+                      </p>
                     </div>
 
                     <div>
@@ -2065,18 +2180,27 @@ export default function Catalogue() {
                       />
                     </div>
 
+                    {/* 👇 Size input (comma-separated) */}
+                    <div>
+                      <Label className="text-gray-300">Sizes (comma separated)</Label>
+                      <Input
+                        value={editProduct.size?.join(", ") || ""}
+                        onChange={(e) =>
+                          setEditProduct({
+                            ...editProduct,
+                            size: e.target.value.split(",").map(s => s.trim()).filter(Boolean),
+                          })
+                        }
+                        placeholder="e.g. S, M, L, XL"
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
+                      <p className="text-xs text-gray-400 mt-1">
+                        Enter sizes separated by commas
+                      </p>
+                    </div>
+
                     <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label className="text-gray-300">Size</Label>
-                        <Input
-                          value={editProduct.size}
-                          onChange={(e) =>
-                            setEditProduct({ ...editProduct, size: e.target.value })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
                       <div>
                         <Label className="text-gray-300">Weight</Label>
                         <Input
@@ -2088,14 +2212,25 @@ export default function Catalogue() {
                           className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
                         />
                       </div>
+                      <div>
+                        <Label className="text-gray-300">Location</Label>
+                        <Input
+                          value={editProduct.location}
+                          onChange={(e) =>
+                            setEditProduct({ ...editProduct, location: e.target.value })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
                     </div>
 
                     <div>
-                      <Label className="text-gray-300">Location</Label>
+                      <Label className="text-gray-300">Delivery Time</Label>
                       <Input
-                        value={editProduct.location}
+                        value={editProduct.deliveryTime}
                         onChange={(e) =>
-                          setEditProduct({ ...editProduct, location: e.target.value })
+                          setEditProduct({ ...editProduct, deliveryTime: e.target.value })
                         }
                         disabled={saving}
                         className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
