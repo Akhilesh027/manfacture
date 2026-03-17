@@ -1,5 +1,6 @@
-// src/pages/Catalogue.tsx – updated for multiple sizes and multiple colors
-import { useEffect, useMemo, useState } from "react";
+// src/pages/Catalogue.tsx – with variants, fabric types, extra pillows, per‑variant pricing,
+// quick‑selection buttons for colors and sizes, and custom color entry (tag input).
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { Helmet } from "react-helmet-async";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { Button } from "@/components/ui/button";
@@ -30,9 +31,27 @@ import {
   Save,
   AlertTriangle,
   Check,
+  Layers,
 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+
+// ----------------------------------------------------------------------
+// TYPES
+// ----------------------------------------------------------------------
+interface ProductVariant {
+  _id?: string;                      // existing variant id (if any)
+  attributes: {
+    size?: string;
+    color?: string;
+    fabric?: string;
+  };
+  sku: string;
+  price: number;                      // 0 means use product base price
+  quantity: number;
+  lowStockThreshold: number;
+  image?: string;                      // optional variant image
+}
 
 interface Product {
   _id: string;
@@ -44,22 +63,29 @@ interface Product {
   shortDescription?: string;
   price: number;
 
-  // ✅ inventory
+  // inventory (simple products only; for variants, use variants array)
   quantity: number;
   lowStockThreshold?: number;
   availability: "In Stock" | "Out of Stock" | "Low Stock";
 
-  // 👇 changed to array
-  color: string[]; // hex values
+  color: string[]; // hex values or color names
   material: string;
-  // 👇 changed to array
   size: string[];
+
+  // NEW FIELDS
+  fabricTypes?: string[];            // e.g., ["cotton", "polyester"]
+  extraPillows?: number;              // number of extra pillows included
+
   weight: string;
   location: string;
   deliveryTime?: string;
 
   image: string;
   galleryImages: string[];
+
+  // VARIANTS (if any)
+  variants?: ProductVariant[];
+  hasVariants: boolean;                // derived flag, not stored
 
   createdAt: string;
   updatedAt: string;
@@ -78,6 +104,9 @@ type CategoryNode = {
   segment?: string;
 };
 
+// ----------------------------------------------------------------------
+// CONSTANTS
+// ----------------------------------------------------------------------
 const API_BASE = "https://api.jsgallor.com";
 const MAX_TOTAL_IMAGES = 5;
 
@@ -90,19 +119,36 @@ const colors = [
   { name: "Blue", value: "#2C3E50" },
 ];
 
-// helper to display color names from hex array
-const colorNames = (hexArray?: string[]) => {
-  if (!hexArray || hexArray.length === 0) return "N/A";
-  return hexArray
-    .map(
-      (hex) =>
-        colors.find((c) => c.value.toLowerCase() === hex.toLowerCase())?.name ||
-        hex
-    )
+const fabrics = [
+  { name: "Cotton", value: "cotton" },
+  { name: "Polyester", value: "polyester" },
+  { name: "Linen", value: "linen" },
+  { name: "Velvet", value: "velvet" },
+  { name: "Leather", value: "leather" },
+  { name: "Suede", value: "suede" },
+  { name: "Chenille", value: "chenille" },
+  { name: "Microfiber", value: "microfiber" },
+];
+
+// helper to display color names from hex array (fallback to original string)
+const colorNames = (colorArray?: string[]) => {
+  if (!colorArray || colorArray.length === 0) return "N/A";
+  return colorArray
+    .map((c) => {
+      const found = colors.find((col) => col.value.toLowerCase() === c.toLowerCase());
+      return found ? found.name : c;
+    })
     .join(", ");
 };
 
-// ✅ inventory-safe availability
+const fabricNames = (fabricArray?: string[]) => {
+  if (!fabricArray || fabricArray.length === 0) return "N/A";
+  return fabricArray
+    .map((val) => fabrics.find((f) => f.value === val)?.name || val)
+    .join(", ");
+};
+
+// ✅ inventory-safe availability (for simple products)
 const computeAvailability = (qty: number, low = 5) => {
   const q = Number.isFinite(qty) ? qty : 0;
   const l = Number.isFinite(low) ? low : 5;
@@ -111,8 +157,30 @@ const computeAvailability = (qty: number, low = 5) => {
   return "In Stock";
 };
 
-// ---------------- API Helpers ----------------
-const apiRequest = async (method: string, endpoint: string, data?: any) => {
+// compute total stock for a product (sum of variants if any)
+const totalStock = (product: Product): number => {
+  if (product.variants && product.variants.length > 0) {
+    return product.variants.reduce((sum, v) => sum + (v.quantity || 0), 0);
+  }
+  return product.quantity ?? 0;
+};
+
+// compute overall availability based on total stock
+const overallAvailability = (product: Product): string => {
+  if (product.variants && product.variants.length > 0) {
+    const total = totalStock(product);
+    const anyLow = product.variants.some(v => v.quantity <= (v.lowStockThreshold ?? 5));
+    if (total <= 0) return "Out of Stock";
+    if (anyLow) return "Low Stock";
+    return "In Stock";
+  }
+  return computeAvailability(product.quantity ?? 0, product.lowStockThreshold ?? 5);
+};
+
+// ----------------------------------------------------------------------
+// API HELPERS
+// ----------------------------------------------------------------------
+const apiRequest = async <T = any>(method: string, endpoint: string, data?: any): Promise<T> => {
   const token = localStorage.getItem("token");
 
   const response = await fetch(`${API_BASE}${endpoint}`, {
@@ -130,7 +198,7 @@ const apiRequest = async (method: string, endpoint: string, data?: any) => {
     throw new Error(payload?.message || "Request failed");
   }
 
-  return payload;
+  return payload as T;
 };
 
 const uploadManyImages = async (files: File[]) => {
@@ -153,7 +221,9 @@ const uploadManyImages = async (files: File[]) => {
   return data.files as { url: string; public_id?: string }[];
 };
 
-// ---------------- SKU Helpers ----------------
+// ----------------------------------------------------------------------
+// SKU Helpers
+// ----------------------------------------------------------------------
 const slugifySku = (s: string) =>
   (s || "")
     .trim()
@@ -175,6 +245,13 @@ const generateSku = (name: string, category: string) => {
   return `${c}-${n || "ITEM"}-${randomAlnum(6)}`;
 };
 
+const generateVariantSku = (baseSku: string, attributes: Record<string, string>) => {
+  const attPart = Object.values(attributes)
+    .map(v => slugifySku(v).substring(0, 3))
+    .join("-");
+  return `${baseSku}-${attPart}-${randomAlnum(4)}`;
+};
+
 function safeItemsFromCategoryResponse(res: any): CategoryNode[] {
   const items =
     res?.items ||
@@ -185,6 +262,9 @@ function safeItemsFromCategoryResponse(res: any): CategoryNode[] {
   return Array.isArray(items) ? items : [];
 }
 
+// ----------------------------------------------------------------------
+// MAIN COMPONENT
+// ----------------------------------------------------------------------
 export default function Catalogue() {
   const [products, setProducts] = useState<Product[]>([]);
   const [filteredProducts, setFilteredProducts] = useState<Product[]>([]);
@@ -205,6 +285,26 @@ export default function Catalogue() {
   const [categoryNodes, setCategoryNodes] = useState<CategoryNode[]>([]);
   const [catLoading, setCatLoading] = useState(false);
 
+  // Quick inventory draft (only for simple products)
+  const [invDraft, setInvDraft] = useState<Record<string, { qty: string; low: string }>>({});
+
+  // Custom color input states
+  const [customColorInput, setCustomColorInput] = useState("");
+  const [editCustomColorInput, setEditCustomColorInput] = useState("");
+
+  // --------------------------------------------------------------------
+  // Helper functions for color array management
+  // --------------------------------------------------------------------
+  const addColorToArray = (currentColors: string[], newColor: string): string[] => {
+    const trimmed = newColor.trim();
+    if (!trimmed) return currentColors;
+    if (currentColors.includes(trimmed)) return currentColors;
+    return [...currentColors, trimmed];
+  };
+
+  // --------------------------------------------------------------------
+  // Fetch categories
+  // --------------------------------------------------------------------
   const fetchCategories = async () => {
     try {
       setCatLoading(true);
@@ -262,8 +362,6 @@ export default function Catalogue() {
   };
 
   const getParentIdForProduct = (p: Product) => {
-    // If backend sends categoryId as parent id, great.
-    // Else infer from slug.
     if (p.categoryId) return p.categoryId;
     const node = categoryBySlug.get((p.category || "").trim());
     if (!node) return null;
@@ -271,24 +369,25 @@ export default function Catalogue() {
   };
 
   const getSubIdForProduct = (p: Product) => {
-    // If backend sends subCategoryId, use it
     if (p.subCategoryId) return p.subCategoryId;
     const node = categoryBySlug.get((p.subcategory || "").trim());
     return node?.id || null;
   };
 
-  // Products
+  // --------------------------------------------------------------------
+  // Fetch products
+  // --------------------------------------------------------------------
   const fetchProducts = async () => {
     try {
       setLoading(true);
-      const data = await apiRequest("GET", "/api/products");
-      const list = (data.products || []) as Product[];
+      const data = await apiRequest<{ products: Product[] }>("GET", "/api/products");
+      const list = data.products || [];
 
-      // ✅ enforce safe availability display from quantity and normalise size & color
+      // normalize each product (ensure arrays, compute availability, set hasVariants flag)
       const normalized = list.map((p) => {
         const low = p.lowStockThreshold ?? 5;
-        
-        // ensure size is always an array
+
+        // ensure size array
         let sizeArray: string[];
         if (Array.isArray(p.size)) {
           sizeArray = p.size;
@@ -298,7 +397,7 @@ export default function Catalogue() {
           sizeArray = [];
         }
 
-        // ensure color is always an array
+        // ensure color array
         let colorArray: string[];
         if (Array.isArray(p.color)) {
           colorArray = p.color;
@@ -308,17 +407,30 @@ export default function Catalogue() {
           colorArray = [];
         }
 
+        // ensure fabricTypes array
+        let fabricArray: string[] = [];
+        if (Array.isArray(p.fabricTypes)) {
+          fabricArray = p.fabricTypes;
+        } else if (typeof p.fabricTypes === "string" && p.fabricTypes) {
+          fabricArray = [p.fabricTypes];
+        }
+
+        const hasVariants = !!(p.variants && p.variants.length > 0);
+
         return {
           ...p,
           lowStockThreshold: low,
-          availability: computeAvailability(p.quantity ?? 0, low),
+          availability: hasVariants
+            ? overallAvailability(p) // will be recomputed later
+            : computeAvailability(p.quantity ?? 0, low),
           size: sizeArray,
           color: colorArray,
+          fabricTypes: fabricArray,
+          hasVariants,
         };
       });
 
       setProducts(normalized);
-      setFilteredProducts(normalized);
     } catch (error: any) {
       toast({
         title: "Error",
@@ -330,66 +442,29 @@ export default function Catalogue() {
     }
   };
 
+  // Initial fetch
   useEffect(() => {
     fetchProducts();
     fetchCategories();
   }, []);
 
-  /** ---------------------------
-   * Add form state
-   * -------------------------- */
-  const [newProduct, setNewProduct] = useState({
-    name: "",
-    parentCategoryId: "",
-    subCategoryId: "",
-    category: "", // parent slug (optional)
-    subcategory: "", // child slug (optional)
+  // Initialize inventory drafts for simple products
+  useEffect(() => {
+    const initial: Record<string, { qty: string; low: string }> = {};
+    products.forEach((p) => {
+      if (!p.hasVariants) {
+        initial[p._id] = {
+          qty: String(p.quantity ?? 0),
+          low: String(p.lowStockThreshold ?? 5),
+        };
+      }
+    });
+    setInvDraft(initial);
+  }, [products]);
 
-    sku: "",
-    description: "",
-    shortDescription: "",
-    price: "",
-    quantity: "",
-    lowStockThreshold: "5",
-
-    // 👇 will be stored as array, but form uses checkboxes
-    color: [] as string[],
-    material: "",
-    // 👇 size input will be comma-separated string
-    size: "",
-    weight: "",
-    location: "",
-    deliveryTime: "",
-
-    image: "https://via.placeholder.com/600x400?text=Main+Image",
-  });
-
-  // Add uploads (files + previews)
-  const [newMainFile, setNewMainFile] = useState<File | null>(null);
-  const [newMainPreview, setNewMainPreview] = useState<string>("");
-
-  const [newGalleryFiles, setNewGalleryFiles] = useState<File[]>([]);
-  const [newGalleryPreviews, setNewGalleryPreviews] = useState<string[]>([]);
-
-  // Edit uploads + category selections
-  const [editMainFile, setEditMainFile] = useState<File | null>(null);
-  const [editMainPreview, setEditMainPreview] = useState<string>("");
-
-  const [editNewGalleryFiles, setEditNewGalleryFiles] = useState<File[]>([]);
-  const [editNewGalleryPreviews, setEditNewGalleryPreviews] = useState<string[]>(
-    [],
-  );
-
-  const [editParentId, setEditParentId] = useState<string>("");
-  const [editSubId, setEditSubId] = useState<string>("");
-
-  // Quick inventory state (per product)
-  const [invSavingId, setInvSavingId] = useState<string | null>(null);
-  const [invDraft, setInvDraft] = useState<Record<string, { qty: string; low: string }>>({});
-
-  /** ---------------------------
-   * Filter products (search + parent/sub filters)
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Filter products
+  // --------------------------------------------------------------------
   useEffect(() => {
     let filtered = products;
 
@@ -403,13 +478,12 @@ export default function Catalogue() {
             .includes(s) ||
           (p.sku || "").toLowerCase().includes(s) ||
           (p.description || "").toLowerCase().includes(s) ||
-          // search in sizes
           (Array.isArray(p.size) && p.size.some(sz => sz.toLowerCase().includes(s))) ||
-          // search in color names
           (Array.isArray(p.color) && p.color.some(col => {
             const colName = colors.find(c => c.value.toLowerCase() === col.toLowerCase())?.name.toLowerCase();
-            return colName?.includes(s);
-          }))
+            return colName?.includes(s) || col.toLowerCase().includes(s);
+          })) ||
+          (Array.isArray(p.fabricTypes) && p.fabricTypes.some(f => f.toLowerCase().includes(s)))
       );
     }
 
@@ -430,6 +504,9 @@ export default function Catalogue() {
     setFilteredProducts(filtered);
   }, [searchTerm, selectedParentId, selectedSubId, products, categoryBySlug]);
 
+  // --------------------------------------------------------------------
+  // UI helpers
+  // --------------------------------------------------------------------
   const getAvailabilityColor = (availability: string) => {
     switch (availability) {
       case "In Stock":
@@ -443,31 +520,102 @@ export default function Catalogue() {
     }
   };
 
-  const cleanupObjectUrl = (url: string) => {
-    try {
-      if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
-    } catch {}
-  };
+  // --------------------------------------------------------------------
+  // Blob URL cleanup (on unmount)
+  // --------------------------------------------------------------------
+  const revokeBlobUrls = useCallback((...urls: string[]) => {
+    urls.forEach(url => {
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    });
+  }, []);
 
-  const resetAddUploadState = () => {
-    if (newMainPreview) cleanupObjectUrl(newMainPreview);
-    newGalleryPreviews.forEach(cleanupObjectUrl);
+  useEffect(() => {
+    return () => {
+      // cleanup any lingering blob URLs on unmount
+    };
+  }, []);
+
+  // --------------------------------------------------------------------
+  // Add product form state
+  // --------------------------------------------------------------------
+  const [newProduct, setNewProduct] = useState({
+    name: "",
+    parentCategoryId: "",
+    subCategoryId: "",
+    category: "", // parent slug (optional)
+    subcategory: "", // child slug (optional)
+
+    sku: "",
+    description: "",
+    shortDescription: "",
+    price: "",
+    quantity: "",
+    lowStockThreshold: "5",
+
+    // colors (array)
+    color: [] as string[],
+    material: "",
+    // sizes (comma-separated string)
+    size: "",
+    // NEW: fabric types (array)
+    fabricTypes: [] as string[],
+    // NEW: extra pillows (number)
+    extraPillows: "",
+
+    weight: "",
+    location: "",
+    deliveryTime: "",
+
+    image: "https://via.placeholder.com/600x400?text=Main+Image",
+
+    // variant toggle
+    enableVariants: false,
+    // variants array (for when enableVariants is true)
+    variants: [] as ProductVariant[],
+  });
+
+  // Add uploads (files + previews)
+  const [newMainFile, setNewMainFile] = useState<File | null>(null);
+  const [newMainPreview, setNewMainPreview] = useState<string>("");
+  const [newGalleryFiles, setNewGalleryFiles] = useState<File[]>([]);
+  const [newGalleryPreviews, setNewGalleryPreviews] = useState<string[]>([]);
+
+  // Edit uploads + category selections
+  const [editMainFile, setEditMainFile] = useState<File | null>(null);
+  const [editMainPreview, setEditMainPreview] = useState<string>("");
+  const [editNewGalleryFiles, setEditNewGalleryFiles] = useState<File[]>([]);
+  const [editNewGalleryPreviews, setEditNewGalleryPreviews] = useState<string[]>([]);
+
+  const [editParentId, setEditParentId] = useState<string>("");
+  const [editSubId, setEditSubId] = useState<string>("");
+  const [editEnableVariants, setEditEnableVariants] = useState(false);
+  const [editVariants, setEditVariants] = useState<ProductVariant[]>([]);
+
+  // Quick inventory saving id
+  const [invSavingId, setInvSavingId] = useState<string | null>(null);
+
+  // --------------------------------------------------------------------
+  // Reset add/upload state
+  // --------------------------------------------------------------------
+  const resetAddUploadState = useCallback(() => {
+    revokeBlobUrls(newMainPreview, ...newGalleryPreviews);
     setNewMainFile(null);
     setNewMainPreview("");
     setNewGalleryFiles([]);
     setNewGalleryPreviews([]);
-  };
+  }, [newMainPreview, newGalleryPreviews, revokeBlobUrls]);
 
-  const resetEditUploadState = () => {
-    if (editMainPreview) cleanupObjectUrl(editMainPreview);
-    editNewGalleryPreviews.forEach(cleanupObjectUrl);
+  const resetEditUploadState = useCallback(() => {
+    revokeBlobUrls(editMainPreview, ...editNewGalleryPreviews);
     setEditMainFile(null);
     setEditMainPreview("");
     setEditNewGalleryFiles([]);
     setEditNewGalleryPreviews([]);
-  };
+  }, [editMainPreview, editNewGalleryPreviews, revokeBlobUrls]);
 
+  // --------------------------------------------------------------------
   // Add: default category selection when modal opens
+  // --------------------------------------------------------------------
   useEffect(() => {
     if (!addOpen) return;
     if (!parentCategories.length) return;
@@ -487,7 +635,9 @@ export default function Catalogue() {
     });
   }, [addOpen, parentCategories, subsByParent]);
 
-  // Edit: when opening edit, set parent/sub selections from product
+  // --------------------------------------------------------------------
+  // Edit: when opening edit, set parent/sub selections and variants
+  // --------------------------------------------------------------------
   useEffect(() => {
     if (!editProduct) return;
 
@@ -495,17 +645,19 @@ export default function Catalogue() {
     const sid = getSubIdForProduct(editProduct) || "";
     setEditParentId(pid);
     setEditSubId(sid);
+    setEditEnableVariants(editProduct.hasVariants);
+    setEditVariants(editProduct.variants || []);
 
     resetEditUploadState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editProduct?._id]);
 
-  /** ---------------------------
-   * Add: select main image
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Add image handlers (same as before, but using revokeBlobUrls)
+  // --------------------------------------------------------------------
   const onPickNewMain = (file: File | null) => {
     if (!file) {
-      if (newMainPreview) cleanupObjectUrl(newMainPreview);
+      if (newMainPreview) revokeBlobUrls(newMainPreview);
       setNewMainFile(null);
       setNewMainPreview("");
       return;
@@ -521,7 +673,7 @@ export default function Catalogue() {
       return;
     }
 
-    if (newMainPreview) cleanupObjectUrl(newMainPreview);
+    if (newMainPreview) revokeBlobUrls(newMainPreview);
     setNewMainFile(file);
     setNewMainPreview(URL.createObjectURL(file));
   };
@@ -542,28 +694,25 @@ export default function Catalogue() {
       });
     }
 
-    newGalleryPreviews.forEach(cleanupObjectUrl);
+    revokeBlobUrls(...newGalleryPreviews);
     setNewGalleryFiles(allowed);
     setNewGalleryPreviews(allowed.map((f) => URL.createObjectURL(f)));
   };
 
   const removeNewGalleryAt = (index: number) => {
-    cleanupObjectUrl(newGalleryPreviews[index]);
+    revokeBlobUrls(newGalleryPreviews[index]);
     setNewGalleryFiles((prev) => prev.filter((_, i) => i !== index));
     setNewGalleryPreviews((prev) => prev.filter((_, i) => i !== index));
   };
 
-  /** ---------------------------
-   * Edit: pick main image
-   * -------------------------- */
   const onPickEditMain = (file: File | null) => {
     if (!file) {
-      if (editMainPreview) cleanupObjectUrl(editMainPreview);
+      if (editMainPreview) revokeBlobUrls(editMainPreview);
       setEditMainFile(null);
       setEditMainPreview("");
       return;
     }
-    if (editMainPreview) cleanupObjectUrl(editMainPreview);
+    if (editMainPreview) revokeBlobUrls(editMainPreview);
     setEditMainFile(file);
     setEditMainPreview(URL.createObjectURL(file));
   };
@@ -586,13 +735,13 @@ export default function Catalogue() {
       });
     }
 
-    editNewGalleryPreviews.forEach(cleanupObjectUrl);
+    revokeBlobUrls(...editNewGalleryPreviews);
     setEditNewGalleryFiles(allowed);
     setEditNewGalleryPreviews(allowed.map((f) => URL.createObjectURL(f)));
   };
 
   const removeEditNewGalleryAt = (index: number) => {
-    cleanupObjectUrl(editNewGalleryPreviews[index]);
+    revokeBlobUrls(editNewGalleryPreviews[index]);
     setEditNewGalleryFiles((prev) => prev.filter((_, i) => i !== index));
     setEditNewGalleryPreviews((prev) => prev.filter((_, i) => i !== index));
   };
@@ -603,9 +752,9 @@ export default function Catalogue() {
     setEditProduct({ ...editProduct, galleryImages: next });
   };
 
-  /** ---------------------------
-   * SKU Auto generate (Add)
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // SKU Auto generate (Add)
+  // --------------------------------------------------------------------
   useEffect(() => {
     if (!addOpen) return;
 
@@ -617,7 +766,7 @@ export default function Catalogue() {
       return { ...prev, sku: autoSku };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addOpen, newProduct.name, newProduct.parentCategoryId]);
+  }, [addOpen, newProduct.name, newProduct.parentCategoryId, categoryById]);
 
   const forceGenerateNewSku = () => {
     const parent = categoryById.get(newProduct.parentCategoryId);
@@ -635,9 +784,99 @@ export default function Catalogue() {
     );
   };
 
-  /** ---------------------------
-   * CRUD: Add
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Variant generation (for add form)
+  // --------------------------------------------------------------------
+  const generateVariantsFromSelections = useCallback((
+    sizes: string[],
+    colors: string[],
+    fabrics: string[],
+    baseSku: string,
+    basePrice: number,
+    baseLow: number
+  ): ProductVariant[] => {
+    const combos: Array<{ size?: string; color?: string; fabric?: string }> = [];
+    // If no sizes, colors, fabrics selected, return empty
+    const sizeList = sizes.length ? sizes : [undefined];
+    const colorList = colors.length ? colors : [undefined];
+    const fabricList = fabrics.length ? fabrics : [undefined];
+
+    sizeList.forEach(size => {
+      colorList.forEach(color => {
+        fabricList.forEach(fabric => {
+          // skip if all undefined? we allow empty variant? maybe not.
+          if (!size && !color && !fabric) return;
+          combos.push({ size, color, fabric });
+        });
+      });
+    });
+
+    return combos.map((attrs) => ({
+      attributes: attrs,
+      sku: generateVariantSku(baseSku, attrs as Record<string, string>),
+      price: basePrice,
+      quantity: 0,
+      lowStockThreshold: baseLow,
+    }));
+  }, []);
+
+  // When enableVariants toggled or selections change, regenerate variants
+  useEffect(() => {
+    if (!addOpen || !newProduct.enableVariants) return;
+
+    // parse sizes from comma string
+    const sizeArray = newProduct.size
+      ? newProduct.size.split(",").map(s => s.trim()).filter(Boolean)
+      : [];
+    const colorArray = newProduct.color; // already array
+    const fabricArray = newProduct.fabricTypes;
+
+    const baseSku = newProduct.sku || "TEMP";
+    const basePrice = parseFloat(newProduct.price) || 0;
+    const baseLow = parseInt(newProduct.lowStockThreshold || "5", 10);
+
+    const generated = generateVariantsFromSelections(
+      sizeArray,
+      colorArray,
+      fabricArray,
+      baseSku,
+      basePrice,
+      baseLow
+    );
+
+    setNewProduct(prev => ({
+      ...prev,
+      variants: generated,
+    }));
+  }, [
+    addOpen,
+    newProduct.enableVariants,
+    newProduct.size,
+    newProduct.color,
+    newProduct.fabricTypes,
+    newProduct.sku,
+    newProduct.price,
+    newProduct.lowStockThreshold,
+    generateVariantsFromSelections,
+  ]);
+
+  // Update a single variant in add form
+  const updateNewVariant = (index: number, field: keyof ProductVariant, value: any) => {
+    setNewProduct(prev => {
+      const updated = [...(prev.variants || [])];
+      if (!updated[index]) return prev;
+      if (field === 'attributes') {
+        updated[index] = { ...updated[index], attributes: value };
+      } else if (field === 'sku' || field === 'price' || field === 'quantity' || field === 'lowStockThreshold') {
+        updated[index] = { ...updated[index], [field]: value };
+      }
+      return { ...prev, variants: updated };
+    });
+  };
+
+  // --------------------------------------------------------------------
+  // Add product submit
+  // --------------------------------------------------------------------
   const handleAdd = async () => {
     if (!newProduct.name || !newProduct.parentCategoryId || !newProduct.price) {
       toast({
@@ -656,6 +895,30 @@ export default function Catalogue() {
         variant: "destructive",
       });
       return;
+    }
+
+    // Validate variants if enabled
+    if (newProduct.enableVariants) {
+      if (!newProduct.variants || newProduct.variants.length === 0) {
+        toast({
+          title: "Error",
+          description: "Please add at least one variant when variants are enabled.",
+          variant: "destructive",
+        });
+        return;
+      }
+      // check each variant has sku and valid numbers
+      for (let i = 0; i < newProduct.variants.length; i++) {
+        const v = newProduct.variants[i];
+        if (!v.sku.trim()) {
+          toast({ title: "Error", description: `Variant #${i+1} SKU is required.`, variant: "destructive" });
+          return;
+        }
+        if (v.quantity < 0 || v.lowStockThreshold < 0) {
+          toast({ title: "Error", description: `Variant #${i+1} quantity/threshold must be >=0.`, variant: "destructive" });
+          return;
+        }
+      }
     }
 
     try {
@@ -685,65 +948,63 @@ export default function Catalogue() {
         ? categoryById.get(newProduct.subCategoryId)
         : null;
 
-      const qty = newProduct.quantity ? parseInt(newProduct.quantity, 10) : 0;
-      const low = newProduct.lowStockThreshold
-        ? parseInt(newProduct.lowStockThreshold, 10)
-        : 5;
-
-      // Convert size string to array (split by comma)
-      const sizeArray = newProduct.size
-        ? newProduct.size.split(",").map(s => s.trim()).filter(Boolean)
-        : [];
-
-      const productData = {
+      // Build product data
+      const productData: any = {
         name: newProduct.name,
-
-        // ✅ send IDs + slugs (backend accepts both)
         categoryId: parent?.id,
         subCategoryId: sub?.id || null,
         category: parent?.slug,
         subcategory: sub?.slug || "",
-
         sku: newProduct.sku,
         shortDescription: newProduct.shortDescription,
         description: newProduct.description,
         price: parseFloat(newProduct.price),
-        quantity: qty,
-        lowStockThreshold: low,
-
-        // availability ignored by backend (safe)
-        availability: computeAvailability(qty, low),
-
-        // 👇 send as arrays
         color: newProduct.color,
         material: newProduct.material,
-        size: sizeArray,
         weight: newProduct.weight,
         location: newProduct.location,
         deliveryTime: newProduct.deliveryTime,
-
         image: mainImageUrl,
         galleryImages: galleryUrls,
+        fabricTypes: newProduct.fabricTypes,
+        extraPillows: newProduct.extraPillows ? parseInt(newProduct.extraPillows, 10) : 0,
       };
 
-      const data = await apiRequest("POST", "/api/products", productData);
+      if (newProduct.enableVariants) {
+        // For variant product, send variants array; simple product fields (quantity, lowStockThreshold) are ignored by backend
+        productData.variants = newProduct.variants?.map(v => ({
+          ...v,
+          price: v.price, // keep as is, backend may store 0 as inherit
+        }));
+        productData.hasVariants = true;
+      } else {
+        // Simple product: send quantity and threshold
+        const qty = newProduct.quantity ? parseInt(newProduct.quantity, 10) : 0;
+        const low = newProduct.lowStockThreshold ? parseInt(newProduct.lowStockThreshold, 10) : 5;
+        productData.quantity = qty;
+        productData.lowStockThreshold = low;
+        productData.hasVariants = false;
+      }
 
-      const created = data.product as Product;
-      const createdNormalized: Product = {
+      const data = await apiRequest<{ product: Product }>("POST", "/api/products", productData);
+
+      const created = data.product;
+      // Normalize
+      const normalized: Product = {
         ...created,
-        lowStockThreshold: created.lowStockThreshold ?? low,
-        availability: computeAvailability(created.quantity ?? 0, created.lowStockThreshold ?? low),
-        // ensure arrays
+        lowStockThreshold: created.lowStockThreshold ?? 5,
+        availability: overallAvailability(created),
         color: Array.isArray(created.color) ? created.color : (created.color ? [created.color] : []),
         size: Array.isArray(created.size) ? created.size : (created.size ? [created.size] : []),
+        fabricTypes: Array.isArray(created.fabricTypes) ? created.fabricTypes : (created.fabricTypes ? [created.fabricTypes] : []),
+        hasVariants: !!(created.variants && created.variants.length > 0),
       };
 
-      const next = [createdNormalized, ...products];
-      setProducts(next);
-      setFilteredProducts(next);
-
+      setProducts(prev => [normalized, ...prev]);
       setAddOpen(false);
+      resetAddUploadState();
 
+      // Reset newProduct
       setNewProduct({
         name: "",
         parentCategoryId: "",
@@ -759,13 +1020,16 @@ export default function Catalogue() {
         color: [],
         material: "",
         size: "",
+        fabricTypes: [],
+        extraPillows: "",
         weight: "",
         location: "",
         deliveryTime: "",
         image: "https://via.placeholder.com/600x400?text=Main+Image",
+        enableVariants: false,
+        variants: [],
       });
 
-      resetAddUploadState();
       toast({ title: "Success", description: "Product created successfully" });
     } catch (error: any) {
       toast({
@@ -778,9 +1042,9 @@ export default function Catalogue() {
     }
   };
 
-  /** ---------------------------
-   * Delete
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Delete product
+  // --------------------------------------------------------------------
   const handleDelete = async (id: string) => {
     if (!window.confirm("Are you sure you want to delete this product?")) return;
 
@@ -788,7 +1052,6 @@ export default function Catalogue() {
       await apiRequest("DELETE", `/api/products/${id}`);
       const next = products.filter((p) => p._id !== id);
       setProducts(next);
-      setFilteredProducts((prev) => prev.filter((p) => p._id !== id));
       if (viewProduct?._id === id) setViewProduct(null);
       if (editProduct?._id === id) setEditProduct(null);
       toast({ title: "Success", description: "Product deleted successfully" });
@@ -801,9 +1064,9 @@ export default function Catalogue() {
     }
   };
 
-  /** ---------------------------
-   * Save Edit
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Save Edit
+  // --------------------------------------------------------------------
   const handleSaveEdit = async () => {
     if (!editProduct) return;
 
@@ -818,6 +1081,29 @@ export default function Catalogue() {
         variant: "destructive",
       });
       return;
+    }
+
+    // Validate variants if enabled
+    if (editEnableVariants) {
+      if (!editVariants || editVariants.length === 0) {
+        toast({
+          title: "Error",
+          description: "Please add at least one variant when variants are enabled.",
+          variant: "destructive",
+        });
+        return;
+      }
+      for (let i = 0; i < editVariants.length; i++) {
+        const v = editVariants[i];
+        if (!v.sku.trim()) {
+          toast({ title: "Error", description: `Variant #${i+1} SKU is required.`, variant: "destructive" });
+          return;
+        }
+        if (v.quantity < 0 || v.lowStockThreshold < 0) {
+          toast({ title: "Error", description: `Variant #${i+1} quantity/threshold must be >=0.`, variant: "destructive" });
+          return;
+        }
+      }
     }
 
     try {
@@ -845,52 +1131,50 @@ export default function Catalogue() {
       const parentNode = editParentId ? categoryById.get(editParentId) : undefined;
       const subNode = editSubId ? categoryById.get(editSubId) : undefined;
 
-      const qty = Number(editProduct.quantity ?? 0);
-      const low = Number(editProduct.lowStockThreshold ?? 5);
-      const availability = computeAvailability(qty, low);
-
-      // For size, it's already an array on editProduct; we keep as is
-      // For color, it's already an array
-
-      const updateData: Partial<Product> & any = {
+      const updateData: any = {
         name: editProduct.name,
-
-        // ✅ backend accepts ids and slugs
         categoryId: parentNode?.id,
         subCategoryId: subNode?.id || null,
         category: parentNode?.slug,
         subcategory: subNode?.slug || "",
-
         sku: editProduct.sku,
         shortDescription: editProduct.shortDescription,
         description: editProduct.description,
         price: editProduct.price,
-
-        quantity: qty,
-        lowStockThreshold: low,
-        availability, // backend ignores manual availability but safe
-
         color: editProduct.color,
         material: editProduct.material,
-        size: editProduct.size,
         weight: editProduct.weight,
         location: editProduct.location,
         deliveryTime: editProduct.deliveryTime,
-
         image: mainImageUrl,
         galleryImages: finalGallery,
+        fabricTypes: editProduct.fabricTypes,
+        extraPillows: editProduct.extraPillows,
+        hasVariants: editEnableVariants,
       };
 
-      const data = await apiRequest("PUT", `/api/products/${editProduct._id}`, updateData);
-      const updated = data.product as Product;
+      if (editEnableVariants) {
+        updateData.variants = editVariants.map(v => ({
+          ...v,
+          // ensure _id is sent for existing variants
+        }));
+        // For variant products, don't send quantity/lowStockThreshold
+      } else {
+        updateData.quantity = editProduct.quantity ?? 0;
+        updateData.lowStockThreshold = editProduct.lowStockThreshold ?? 5;
+      }
+
+      const data = await apiRequest<{ product: Product }>("PUT", `/api/products/${editProduct._id}`, updateData);
+      const updated = data.product;
 
       const normalizedUpdated: Product = {
         ...updated,
-        lowStockThreshold: updated.lowStockThreshold ?? low,
-        availability: computeAvailability(updated.quantity ?? 0, updated.lowStockThreshold ?? low),
-        // ensure arrays
+        lowStockThreshold: updated.lowStockThreshold ?? 5,
+        availability: overallAvailability(updated),
         color: Array.isArray(updated.color) ? updated.color : (updated.color ? [updated.color] : []),
         size: Array.isArray(updated.size) ? updated.size : (updated.size ? [updated.size] : []),
+        fabricTypes: Array.isArray(updated.fabricTypes) ? updated.fabricTypes : (updated.fabricTypes ? [updated.fabricTypes] : []),
+        hasVariants: !!(updated.variants && updated.variants.length > 0),
       };
 
       const updatedProducts = products.map((p) =>
@@ -898,8 +1182,6 @@ export default function Catalogue() {
       );
 
       setProducts(updatedProducts);
-      setFilteredProducts(updatedProducts);
-
       setEditProduct(null);
       resetEditUploadState();
 
@@ -915,23 +1197,9 @@ export default function Catalogue() {
     }
   };
 
-  /** ---------------------------
-   * ✅ QUICK INVENTORY UPDATE
-   * PATCH /api/products/:id/inventory
-   * -------------------------- */
-  const initInvDraftIfMissing = (p: Product) => {
-    setInvDraft((prev) => {
-      if (prev[p._id]) return prev;
-      return {
-        ...prev,
-        [p._id]: {
-          qty: String(p.quantity ?? 0),
-          low: String(p.lowStockThreshold ?? 5),
-        },
-      };
-    });
-  };
-
+  // --------------------------------------------------------------------
+  // Quick Inventory Update (only for simple products)
+  // --------------------------------------------------------------------
   const saveInventory = async (productId: string) => {
     const d = invDraft[productId];
     if (!d) return;
@@ -959,12 +1227,12 @@ export default function Catalogue() {
 
     try {
       setInvSavingId(productId);
-      const data = await apiRequest("PATCH", `/api/products/${productId}/inventory`, {
+      const data = await apiRequest<{ product: Product }>("PATCH", `/api/products/${productId}/inventory`, {
         quantity: qty,
         lowStockThreshold: low,
       });
 
-      const updated = data.product as Product;
+      const updated = data.product;
 
       const normalizedUpdated: Product = {
         ...updated,
@@ -972,8 +1240,7 @@ export default function Catalogue() {
         availability: computeAvailability(updated.quantity ?? 0, updated.lowStockThreshold ?? low),
       };
 
-      const next = products.map((p) => (p._id === productId ? normalizedUpdated : p));
-      setProducts(next);
+      setProducts(prev => prev.map(p => p._id === productId ? { ...p, ...normalizedUpdated } : p));
 
       toast({ title: "Inventory updated", description: "Stock updated successfully" });
     } catch (e: any) {
@@ -987,9 +1254,9 @@ export default function Catalogue() {
     }
   };
 
-  /** ---------------------------
-   * UI Loading
-   * -------------------------- */
+  // --------------------------------------------------------------------
+  // Render
+  // --------------------------------------------------------------------
   if (loading) {
     return (
       <DashboardLayout title="Catalogue Management">
@@ -1032,7 +1299,7 @@ export default function Catalogue() {
               </p>
             </div>
 
-            {/* ---------- Add Modal ---------- */}
+            {/* Add Modal Trigger */}
             <Dialog
               open={addOpen}
               onOpenChange={(open) => {
@@ -1047,430 +1314,614 @@ export default function Catalogue() {
                 </Button>
               </DialogTrigger>
 
-              <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto bg-gray-900 border border-gray-800 text-white">
+              <DialogContent className="max-w-4xl max-h-[85vh] overflow-y-auto bg-gray-900 border border-gray-800 text-white">
                 <DialogHeader>
                   <DialogTitle className="text-yellow-400">
                     Add New Product
                   </DialogTitle>
                 </DialogHeader>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Left */}
-                  <div className="space-y-3">
-                    <div>
-                      <Label className="text-gray-300">Product Name *</Label>
-                      <Input
-                        placeholder="Product Name"
-                        value={newProduct.name}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, name: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                <div className="space-y-4">
+                  {/* Toggle Variants */}
+                  <div className="flex items-center gap-3 p-3 bg-gray-800/50 rounded-lg">
+                    <Label className="text-gray-300 cursor-pointer flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={newProduct.enableVariants}
+                        onChange={(e) => setNewProduct(prev => ({ ...prev, enableVariants: e.target.checked }))}
+                        className="rounded border-gray-600"
                       />
+                      <span>This product has variants (different sizes/colors/fabrics with own stock)</span>
+                    </Label>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Left Column - Basic Info */}
+                    <div className="space-y-3">
+                      <div>
+                        <Label className="text-gray-300">Product Name *</Label>
+                        <Input
+                          placeholder="Product Name"
+                          value={newProduct.name}
+                          onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-gray-300">Price *</Label>
+                        <Input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={newProduct.price}
+                          onChange={(e) => setNewProduct({ ...newProduct, price: e.target.value })}
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      {/* Parent Category */}
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <Label className="text-gray-300">Parent Category *</Label>
+                          <button
+                            type="button"
+                            onClick={fetchCategories}
+                            disabled={saving || catLoading}
+                            className="text-xs text-yellow-400 hover:text-yellow-300 flex items-center gap-1"
+                          >
+                            <RefreshCcw className={`w-3 h-3 ${catLoading ? "animate-spin" : ""}`} />
+                            Refresh
+                          </button>
+                        </div>
+                        <select
+                          value={newProduct.parentCategoryId}
+                          onChange={(e) => {
+                            const parentId = e.target.value;
+                            const subs = subsByParent.get(parentId) || [];
+                            const firstSub = subs[0];
+                            setNewProduct((prev) => ({
+                              ...prev,
+                              parentCategoryId: parentId,
+                              subCategoryId: firstSub?.id || "",
+                            }));
+                          }}
+                          disabled={saving || catLoading || parentCategories.length === 0}
+                          className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
+                          focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
+                        >
+                          {parentCategories.length === 0 ? (
+                            <option value="">No categories</option>
+                          ) : (
+                            parentCategories.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </div>
+
+                      {/* Sub Category */}
+                      <div>
+                        <Label className="text-gray-300">Sub Category (optional)</Label>
+                        <select
+                          value={newProduct.subCategoryId || ""}
+                          onChange={(e) =>
+                            setNewProduct((prev) => ({ ...prev, subCategoryId: e.target.value }))
+                          }
+                          disabled={saving || catLoading || !newProduct.parentCategoryId}
+                          className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
+                          focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
+                        >
+                          <option value="">None (use parent)</option>
+                          {addSubs.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* SKU */}
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <Label className="text-gray-300">SKU (auto)</Label>
+                          <button
+                            type="button"
+                            onClick={forceGenerateNewSku}
+                            disabled={saving}
+                            className="text-xs text-yellow-400 hover:text-yellow-300 flex items-center gap-1"
+                          >
+                            <RefreshCcw className="w-3 h-3" />
+                            Regenerate
+                          </button>
+                        </div>
+                        <Input
+                          placeholder="Auto SKU"
+                          value={newProduct.sku}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, sku: e.target.value.toUpperCase() })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      {/* Description */}
+                      <div>
+                        <Label className="text-gray-300">Description</Label>
+                        <Textarea
+                          rows={3}
+                          value={newProduct.description}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, description: e.target.value })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
                     </div>
 
-                    <div>
-                      <Label className="text-gray-300">Price *</Label>
-                      <Input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        placeholder="0.00"
-                        value={newProduct.price}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, price: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
+                    {/* Right Column - Attributes & Images */}
+                    <div className="space-y-3">
+                      {/* Colors */}
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <Label className="text-gray-300">Colors</Label>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setNewProduct(prev => ({ ...prev, color: colors.map(c => c.value) }))}
+                              className="text-xs text-yellow-400 hover:text-yellow-300"
+                            >
+                              Select All
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setNewProduct(prev => ({ ...prev, color: [] }))}
+                              className="text-xs text-yellow-400 hover:text-yellow-300"
+                            >
+                              Clear All
+                            </button>
+                          </div>
+                        </div>
 
-                    {/* ✅ Inventory */}
-                    <div className="grid grid-cols-2 gap-3">
+                        {/* Custom color input */}
+                        <div className="flex gap-2 mt-2">
+                          <Input
+                            placeholder="Enter color name or hex (e.g. Red, #FF0000)"
+                            value={customColorInput}
+                            onChange={(e) => setCustomColorInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                setNewProduct(prev => ({
+                                  ...prev,
+                                  color: addColorToArray(prev.color, customColorInput)
+                                }));
+                                setCustomColorInput('');
+                              }
+                            }}
+                            className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                          />
+                          <Button
+                            type="button"
+                            onClick={() => {
+                              setNewProduct(prev => ({
+                                ...prev,
+                                color: addColorToArray(prev.color, customColorInput)
+                              }));
+                              setCustomColorInput('');
+                            }}
+                            className="bg-yellow-500 hover:bg-yellow-600 text-black"
+                            size="sm"
+                          >
+                            Add
+                          </Button>
+                        </div>
+
+                        {/* Selected colors as tags */}
+                        {newProduct.color.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mt-3">
+                            {newProduct.color.map((color, idx) => (
+                              <span
+                                key={idx}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-gray-700 text-white"
+                              >
+                                <span
+                                  className="w-3 h-3 rounded-full"
+                                  style={{ backgroundColor: color }}
+                                />
+                                {color}
+                                <button
+                                  type="button"
+                                  onClick={() => setNewProduct(prev => ({
+                                    ...prev,
+                                    color: prev.color.filter((_, i) => i !== idx)
+                                  }))}
+                                  className="ml-1 text-gray-400 hover:text-white"
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Predefined color checkboxes */}
+                        <div className="grid grid-cols-2 gap-2 mt-3">
+                          {colors.map((colorOption) => {
+                            const isSelected = newProduct.color.includes(colorOption.value);
+                            return (
+                              <label
+                                key={colorOption.value}
+                                className={cn(
+                                  "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+                                  isSelected
+                                    ? "border-yellow-500 bg-yellow-500/10"
+                                    : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+                                )}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="sr-only"
+                                  checked={isSelected}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setNewProduct((prev) => ({
+                                        ...prev,
+                                        color: addColorToArray(prev.color, colorOption.value),
+                                      }));
+                                    } else {
+                                      setNewProduct((prev) => ({
+                                        ...prev,
+                                        color: prev.color.filter((c) => c !== colorOption.value),
+                                      }));
+                                    }
+                                  }}
+                                />
+                                <div
+                                  className="w-4 h-4 rounded-full border border-gray-600"
+                                  style={{ backgroundColor: colorOption.value }}
+                                />
+                                <span className="text-sm text-white">{colorOption.name}</span>
+                                {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Sizes */}
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <Label className="text-gray-300">Sizes (comma separated)</Label>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!newProduct.size.trim()) {
+                                setNewProduct(prev => ({ ...prev, size: "XS,S,M,L,XL" }));
+                              } else {
+                                toast({ title: "Sizes already set", description: "Clear the field first if you want to auto-fill." });
+                              }
+                            }}
+                            className="text-xs text-yellow-400 hover:text-yellow-300"
+                          >
+                            Set 5 Sizes (XS,S,M,L,XL)
+                          </button>
+                        </div>
+                        <Input
+                          value={newProduct.size}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, size: e.target.value })
+                          }
+                          placeholder="e.g. S, M, L, XL"
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      {/* Fabric Types (NEW) */}
+                      <div>
+                        <Label className="text-gray-300">Fabric Types</Label>
+                        <div className="grid grid-cols-2 gap-2 mt-2">
+                          {fabrics.map((fabric) => {
+                            const isSelected = newProduct.fabricTypes.includes(fabric.value);
+                            return (
+                              <label
+                                key={fabric.value}
+                                className={cn(
+                                  "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+                                  isSelected
+                                    ? "border-yellow-500 bg-yellow-500/10"
+                                    : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+                                )}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="sr-only"
+                                  checked={isSelected}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setNewProduct((prev) => ({
+                                        ...prev,
+                                        fabricTypes: [...prev.fabricTypes, fabric.value],
+                                      }));
+                                    } else {
+                                      setNewProduct((prev) => ({
+                                        ...prev,
+                                        fabricTypes: prev.fabricTypes.filter(f => f !== fabric.value),
+                                      }));
+                                    }
+                                  }}
+                                />
+                                <span className="text-sm text-white">{fabric.name}</span>
+                                {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Extra Pillows (NEW) */}
+                      <div>
+                        <Label className="text-gray-300">Extra Pillows Included</Label>
+                        <Input
+                          type="number"
+                          min="0"
+                          value={newProduct.extraPillows}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, extraPillows: e.target.value })
+                          }
+                          placeholder="0"
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-gray-300">Material</Label>
+                        <Input
+                          value={newProduct.material}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, material: e.target.value })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <Label className="text-gray-300">Weight</Label>
+                          <Input
+                            value={newProduct.weight}
+                            onChange={(e) =>
+                              setNewProduct({ ...newProduct, weight: e.target.value })
+                            }
+                            disabled={saving}
+                            className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                          />
+                        </div>
+                        <div>
+                          <Label className="text-gray-300">Location</Label>
+                          <Input
+                            value={newProduct.location}
+                            onChange={(e) =>
+                              setNewProduct({ ...newProduct, location: e.target.value })
+                            }
+                            disabled={saving}
+                            className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <Label className="text-gray-300">Delivery Time</Label>
+                        <Input
+                          value={newProduct.deliveryTime}
+                          onChange={(e) =>
+                            setNewProduct({ ...newProduct, deliveryTime: e.target.value })
+                          }
+                          disabled={saving}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                      </div>
+
+                      {/* Main Image Upload */}
+                      <div className="mt-2">
+                        <Label className="text-gray-300">Main Image</Label>
+                        <div className="mt-2 rounded-lg overflow-hidden border border-gray-700 bg-gray-800">
+                          <img
+                            src={newMainPreview || newProduct.image}
+                            alt="Main preview"
+                            className="w-full h-40 object-cover"
+                          />
+                        </div>
+                        <Input
+                          type="file"
+                          accept="image/*"
+                          disabled={saving}
+                          onChange={(e) => onPickNewMain(e.target.files?.[0] || null)}
+                          className="mt-3 bg-gray-800 border-gray-700 text-white"
+                        />
+                      </div>
+
+                      {/* Gallery Upload */}
+                      <div className="mt-1">
+                        <Label className="text-gray-300">Gallery Images (optional)</Label>
+                        <Input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          disabled={saving}
+                          onChange={(e) => onPickNewGallery(e.target.files)}
+                          className="mt-2 bg-gray-800 border-gray-700 text-white"
+                        />
+                        {newGalleryPreviews.length > 0 ? (
+                          <div className="flex gap-2 mt-3 overflow-x-auto pb-2">
+                            {newGalleryPreviews.map((src, idx) => (
+                              <div key={idx} className="relative w-20 h-20 flex-shrink-0">
+                                <img
+                                  src={src}
+                                  alt={`Gallery ${idx + 1}`}
+                                  className="w-20 h-20 object-cover rounded-lg border border-gray-700"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeNewGalleryAt(idx)}
+                                  className="absolute -top-2 -right-2 bg-black/70 rounded-full p-1 border border-gray-700 hover:bg-black"
+                                >
+                                  <X className="w-3 h-3 text-white" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="mt-3 text-xs text-gray-400 flex items-center gap-2">
+                            <ImageIcon className="w-4 h-4" />
+                            No gallery images selected
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Variants Table (if enabled) */}
+                  {newProduct.enableVariants && (
+                    <div className="mt-6 border-t border-gray-800 pt-4">
+                      <h3 className="text-yellow-400 font-semibold mb-3">Product Variants</h3>
+                      <p className="text-xs text-gray-400 mb-2">
+                        Variants are generated based on selected sizes, colors, and fabrics. Edit SKU, price, quantity per variant.
+                      </p>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left">
+                          <thead className="text-xs text-gray-400 uppercase bg-gray-800/50">
+                            <tr>
+                              <th className="px-4 py-2">Size</th>
+                              <th className="px-4 py-2">Color</th>
+                              <th className="px-4 py-2">Fabric</th>
+                              <th className="px-4 py-2">SKU</th>
+                              <th className="px-4 py-2">Price</th>
+                              <th className="px-4 py-2">Quantity</th>
+                              <th className="px-4 py-2">Low Stock</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {newProduct.variants?.map((variant, idx) => (
+                              <tr key={idx} className="border-b border-gray-800">
+                                <td className="px-4 py-2">{variant.attributes.size || '-'}</td>
+                                <td className="px-4 py-2">
+                                  {variant.attributes.color ? (
+                                    <div className="flex items-center gap-1">
+                                      <div className="w-4 h-4 rounded-full" style={{ backgroundColor: variant.attributes.color }} />
+                                      <span>{colors.find(c => c.value === variant.attributes.color)?.name || variant.attributes.color}</span>
+                                    </div>
+                                  ) : '-'}
+                                </td>
+                                <td className="px-4 py-2">{fabrics.find(f => f.value === variant.attributes.fabric)?.name || variant.attributes.fabric || '-'}</td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    value={variant.sku}
+                                    onChange={(e) => updateNewVariant(idx, 'sku', e.target.value.toUpperCase())}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    step="0.01"
+                                    value={variant.price}
+                                    onChange={(e) => updateNewVariant(idx, 'price', parseFloat(e.target.value) || 0)}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-24"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    value={variant.quantity}
+                                    onChange={(e) => updateNewVariant(idx, 'quantity', parseInt(e.target.value) || 0)}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-20"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    value={variant.lowStockThreshold}
+                                    onChange={(e) => updateNewVariant(idx, 'lowStockThreshold', parseInt(e.target.value) || 5)}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-20"
+                                  />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Simple product inventory fields (if variants not enabled) */}
+                  {!newProduct.enableVariants && (
+                    <div className="grid grid-cols-2 gap-4 mt-4">
                       <div>
                         <Label className="text-gray-300">Quantity</Label>
                         <Input
                           type="number"
                           min="0"
-                          placeholder="0"
                           value={newProduct.quantity}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, quantity: e.target.value })
-                          }
+                          onChange={(e) => setNewProduct({ ...newProduct, quantity: e.target.value })}
                           disabled={saving}
                           className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
                         />
                       </div>
-
                       <div>
                         <Label className="text-gray-300">Low Stock Threshold</Label>
                         <Input
                           type="number"
                           min="0"
-                          placeholder="5"
                           value={newProduct.lowStockThreshold}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, lowStockThreshold: e.target.value })
-                          }
+                          onChange={(e) => setNewProduct({ ...newProduct, lowStockThreshold: e.target.value })}
                           disabled={saving}
                           className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
                         />
                       </div>
                     </div>
+                  )}
 
-                    {/* ✅ Availability preview (readonly) */}
-                    <div className="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-800/40 p-3">
-                      <div className="text-sm text-gray-300">
-                        Availability (auto)
-                        <div className="text-[11px] text-gray-500">
-                          Computed from quantity & low stock threshold
-                        </div>
-                      </div>
-                      <Badge
-                        className={getAvailabilityColor(
-                          computeAvailability(
-                            parseInt(newProduct.quantity || "0", 10),
-                            parseInt(newProduct.lowStockThreshold || "5", 10),
-                          ),
-                        )}
-                      >
-                        {computeAvailability(
-                          parseInt(newProduct.quantity || "0", 10),
-                          parseInt(newProduct.lowStockThreshold || "5", 10),
-                        )}
-                      </Badge>
-                    </div>
-
-                    {/* Parent Category */}
-                    <div>
-                      <div className="flex items-center justify-between">
-                        <Label className="text-gray-300">Parent Category *</Label>
-                        <button
-                          type="button"
-                          onClick={fetchCategories}
-                          disabled={saving || catLoading}
-                          className="text-xs text-yellow-400 hover:text-yellow-300 flex items-center gap-1"
-                        >
-                          <RefreshCcw className={`w-3 h-3 ${catLoading ? "animate-spin" : ""}`} />
-                          Refresh
-                        </button>
-                      </div>
-
-                      <select
-                        value={newProduct.parentCategoryId}
-                        onChange={(e) => {
-                          const parentId = e.target.value;
-                          const subs = subsByParent.get(parentId) || [];
-                          const firstSub = subs[0];
-
-                          setNewProduct((prev) => ({
-                            ...prev,
-                            parentCategoryId: parentId,
-                            subCategoryId: firstSub?.id || "",
-                          }));
-                        }}
-                        disabled={saving || catLoading || parentCategories.length === 0}
-                        className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
-                        focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
-                      >
-                        {parentCategories.length === 0 ? (
-                          <option value="">No categories</option>
-                        ) : (
-                          parentCategories.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                    </div>
-
-                    {/* Sub Category */}
-                    <div>
-                      <Label className="text-gray-300">Sub Category (optional)</Label>
-                      <select
-                        value={newProduct.subCategoryId || ""}
-                        onChange={(e) =>
-                          setNewProduct((prev) => ({ ...prev, subCategoryId: e.target.value }))
-                        }
-                        disabled={saving || catLoading || !newProduct.parentCategoryId}
-                        className="flex h-10 w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-white
-                        focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 disabled:opacity-50"
-                      >
-                        <option value="">None (use parent)</option>
-                        {addSubs.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {/* SKU */}
-                    <div>
-                      <div className="flex items-center justify-between">
-                        <Label className="text-gray-300">SKU (auto)</Label>
-                        <button
-                          type="button"
-                          onClick={forceGenerateNewSku}
-                          disabled={saving}
-                          className="text-xs text-yellow-400 hover:text-yellow-300 flex items-center gap-1"
-                        >
-                          <RefreshCcw className="w-3 h-3" />
-                          Regenerate
-                        </button>
-                      </div>
-                      <Input
-                        placeholder="Auto SKU"
-                        value={newProduct.sku}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, sku: e.target.value.toUpperCase() })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                      <p className="text-[11px] text-gray-500 mt-1">
-                        SKU is auto-generated, you can edit it if needed.
-                      </p>
-                    </div>
-
-                    <div>
-                      <Label className="text-gray-300">Short Description</Label>
-                      <Input
-                        value={newProduct.shortDescription}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, shortDescription: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
-
-                    <div>
-                      <Label className="text-gray-300">Description</Label>
-                      <Textarea
-                        rows={3}
-                        value={newProduct.description}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, description: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Right */}
-                  <div className="space-y-3">
-                    {/* 👇 Color multi-select checkboxes */}
-                    <div>
-                      <Label className="text-gray-300">Colors</Label>
-                      <div className="grid grid-cols-2 gap-2 mt-2">
-                        {colors.map((colorOption) => {
-                          const isSelected = newProduct.color.includes(colorOption.value);
-                          return (
-                            <label
-                              key={colorOption.value}
-                              className={cn(
-                                "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
-                                isSelected
-                                  ? "border-yellow-500 bg-yellow-500/10"
-                                  : "border-gray-700 bg-gray-800 hover:bg-gray-700"
-                              )}
-                            >
-                              <input
-                                type="checkbox"
-                                className="sr-only"
-                                checked={isSelected}
-                                onChange={(e) => {
-                                  if (e.target.checked) {
-                                    setNewProduct((prev) => ({
-                                      ...prev,
-                                      color: [...prev.color, colorOption.value],
-                                    }));
-                                  } else {
-                                    setNewProduct((prev) => ({
-                                      ...prev,
-                                      color: prev.color.filter((c) => c !== colorOption.value),
-                                    }));
-                                  }
-                                }}
-                              />
-                              <div
-                                className="w-4 h-4 rounded-full border border-gray-600"
-                                style={{ backgroundColor: colorOption.value }}
-                              />
-                              <span className="text-sm text-white">{colorOption.name}</span>
-                              {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
-                            </label>
-                          );
-                        })}
-                      </div>
-                      <p className="text-xs text-gray-400 mt-1">
-                        Selected: {newProduct.color.length} color(s)
-                      </p>
-                    </div>
-
-                    <div>
-                      <Label className="text-gray-300">Material</Label>
-                      <Input
-                        value={newProduct.material}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, material: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
-
-                    {/* 👇 Size input (comma-separated) */}
-                    <div>
-                      <Label className="text-gray-300">Sizes (comma separated)</Label>
-                      <Input
-                        value={newProduct.size}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, size: e.target.value })
-                        }
-                        placeholder="e.g. S, M, L, XL"
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                      <p className="text-xs text-gray-400 mt-1">
-                        Enter sizes separated by commas
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label className="text-gray-300">Weight</Label>
-                        <Input
-                          value={newProduct.weight}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, weight: e.target.value })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
-                      <div>
-                        <Label className="text-gray-300">Location</Label>
-                        <Input
-                          value={newProduct.location}
-                          onChange={(e) =>
-                            setNewProduct({ ...newProduct, location: e.target.value })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <Label className="text-gray-300">Delivery Time</Label>
-                      <Input
-                        value={newProduct.deliveryTime}
-                        onChange={(e) =>
-                          setNewProduct({ ...newProduct, deliveryTime: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
-
-                    {/* Main Image Upload */}
-                    <div className="mt-2">
-                      <Label className="text-gray-300">Main Image</Label>
-
-                      <div className="mt-2 rounded-lg overflow-hidden border border-gray-700 bg-gray-800">
-                        <img
-                          src={newMainPreview || newProduct.image}
-                          alt="Main preview"
-                          className="w-full h-40 object-cover"
-                        />
-                      </div>
-
-                      <Input
-                        type="file"
-                        accept="image/*"
-                        disabled={saving}
-                        onChange={(e) => onPickNewMain(e.target.files?.[0] || null)}
-                        className="mt-3 bg-gray-800 border-gray-700 text-white"
-                      />
-
-                      <p className="text-xs text-gray-400 mt-2">
-                        Total images allowed: {MAX_TOTAL_IMAGES} (main + gallery).
-                      </p>
-                    </div>
-
-                    {/* Gallery Upload */}
-                    <div className="mt-1">
-                      <Label className="text-gray-300">Gallery Images (optional)</Label>
-                      <Input
-                        type="file"
-                        accept="image/*"
-                        multiple
-                        disabled={saving}
-                        onChange={(e) => onPickNewGallery(e.target.files)}
-                        className="mt-2 bg-gray-800 border-gray-700 text-white"
-                      />
-
-                      {newGalleryPreviews.length > 0 ? (
-                        <div className="flex gap-2 mt-3 overflow-x-auto pb-2">
-                          {newGalleryPreviews.map((src, idx) => (
-                            <div key={idx} className="relative w-20 h-20 flex-shrink-0">
-                              <img
-                                src={src}
-                                alt={`Gallery ${idx + 1}`}
-                                className="w-20 h-20 object-cover rounded-lg border border-gray-700"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => removeNewGalleryAt(idx)}
-                                className="absolute -top-2 -right-2 bg-black/70 rounded-full p-1 border border-gray-700 hover:bg-black"
-                              >
-                                <X className="w-3 h-3 text-white" />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
+                  <div className="flex gap-3 mt-6">
+                    <Button
+                      onClick={handleAdd}
+                      className="flex-1 bg-yellow-500 hover:bg-yellow-600 text-black font-semibold"
+                      disabled={saving}
+                    >
+                      {saving ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Saving...
+                        </>
                       ) : (
-                        <div className="mt-3 text-xs text-gray-400 flex items-center gap-2">
-                          <ImageIcon className="w-4 h-4" />
-                          No gallery images selected
-                        </div>
+                        "Save Product"
                       )}
-                    </div>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setAddOpen(false);
+                        resetAddUploadState();
+                      }}
+                      className="flex-1 border-gray-600 text-gray-300 hover:bg-gray-800"
+                      disabled={saving}
+                    >
+                      Cancel
+                    </Button>
                   </div>
-                </div>
-
-                <div className="flex gap-3 mt-6">
-                  <Button
-                    onClick={handleAdd}
-                    className="flex-1 bg-yellow-500 hover:bg-yellow-600 text-black font-semibold"
-                    disabled={saving}
-                  >
-                    {saving ? (
-                      <>
-                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                        Saving...
-                      </>
-                    ) : (
-                      "Save Product"
-                    )}
-                  </Button>
-
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      setAddOpen(false);
-                      resetAddUploadState();
-                    }}
-                    className="flex-1 border-gray-600 text-gray-300 hover:bg-gray-800"
-                    disabled={saving}
-                  >
-                    Cancel
-                  </Button>
                 </div>
               </DialogContent>
             </Dialog>
@@ -1481,7 +1932,7 @@ export default function Catalogue() {
             <div className="relative flex-1">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
               <Input
-                placeholder="Search products by name, category, SKU, size, color..."
+                placeholder="Search products by name, category, SKU, size, color, fabric..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-10 bg-gray-900 border-gray-800 text-white focus:border-yellow-500"
@@ -1539,7 +1990,7 @@ export default function Catalogue() {
           </div>
         </div>
 
-        {/* Empty */}
+        {/* Empty State */}
         {filteredProducts.length === 0 ? (
           <Card className="bg-gray-900 border-gray-800">
             <CardContent className="py-16 text-center">
@@ -1566,18 +2017,9 @@ export default function Catalogue() {
         ) : (
           <div className="space-y-4">
             {filteredProducts.map((product) => {
-              // Ensure draft exists
-              if (!invDraft[product._id]) initInvDraftIfMissing(product);
-
-              const draft = invDraft[product._id] || {
-                qty: String(product.quantity ?? 0),
-                low: String(product.lowStockThreshold ?? 5),
-              };
-
-              const computedAvail = computeAvailability(
-                product.quantity ?? 0,
-                product.lowStockThreshold ?? 5,
-              );
+              const stock = totalStock(product);
+              const avail = overallAvailability(product);
+              const isSimple = !product.hasVariants;
 
               return (
                 <Card
@@ -1610,10 +2052,15 @@ export default function Catalogue() {
                               <span className="text-sm text-gray-400">
                                 SKU: {product.sku || "N/A"}
                               </span>
+                              {product.hasVariants && (
+                                <Badge className="bg-blue-900/30 text-blue-400 border border-blue-800">
+                                  <Layers className="w-3 h-3 mr-1" /> Variants
+                                </Badge>
+                              )}
                             </div>
                           </div>
-                          <Badge className={`${getAvailabilityColor(computedAvail)} font-medium`}>
-                            {computedAvail}
+                          <Badge className={`${getAvailabilityColor(avail)} font-medium`}>
+                            {avail}
                           </Badge>
                         </div>
 
@@ -1626,10 +2073,8 @@ export default function Catalogue() {
                           </div>
 
                           <div className="bg-gray-800/50 p-3 rounded-lg">
-                            <p className="text-xs text-gray-400 mb-1">Quantity</p>
-                            <p className="font-semibold text-white">
-                              {product.quantity ?? 0}
-                            </p>
+                            <p className="text-xs text-gray-400 mb-1">Total Stock</p>
+                            <p className="font-semibold text-white">{stock}</p>
                           </div>
 
                           <div className="bg-gray-800/50 p-3 rounded-lg">
@@ -1647,88 +2092,86 @@ export default function Catalogue() {
                           </div>
                         </div>
 
-                        {/* ✅ Quick Inventory Update */}
-                        <div className="mt-4 rounded-xl border border-gray-800 bg-gray-800/30 p-4">
-                          <div className="flex items-center justify-between gap-3 flex-wrap">
-                            <div className="flex items-center gap-2 text-sm text-gray-300">
-                              <AlertTriangle className="w-4 h-4 text-yellow-400" />
-                              Quick Inventory Update
+                        {/* Quick Inventory (only for simple products) */}
+                        {isSimple && invDraft[product._id] && (
+                          <div className="mt-4 rounded-xl border border-gray-800 bg-gray-800/30 p-4">
+                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                              <div className="flex items-center gap-2 text-sm text-gray-300">
+                                <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                                Quick Inventory Update
+                              </div>
+                              <div className="text-xs text-gray-500">
+                                Updates stock without opening edit modal
+                              </div>
                             </div>
-                            <div className="text-xs text-gray-500">
-                              Updates stock without opening edit modal
+
+                            <div className="mt-3 grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                              <div>
+                                <Label className="text-gray-300">Quantity</Label>
+                                <Input
+                                  type="number"
+                                  min="0"
+                                  value={invDraft[product._id].qty}
+                                  onChange={(e) =>
+                                    setInvDraft((prev) => ({
+                                      ...prev,
+                                      [product._id]: {
+                                        ...prev[product._id],
+                                        qty: e.target.value,
+                                      },
+                                    }))
+                                  }
+                                  className="bg-gray-900 border-gray-700 text-white focus:border-yellow-500"
+                                />
+                              </div>
+                              <div>
+                                <Label className="text-gray-300">Low Stock Threshold</Label>
+                                <Input
+                                  type="number"
+                                  min="0"
+                                  value={invDraft[product._id].low}
+                                  onChange={(e) =>
+                                    setInvDraft((prev) => ({
+                                      ...prev,
+                                      [product._id]: {
+                                        ...prev[product._id],
+                                        low: e.target.value,
+                                      },
+                                    }))
+                                  }
+                                  className="bg-gray-900 border-gray-700 text-white focus:border-yellow-500"
+                                />
+                              </div>
+                              <Button
+                                onClick={() => saveInventory(product._id)}
+                                disabled={invSavingId === product._id}
+                                className="bg-yellow-500 hover:bg-yellow-600 text-black font-semibold"
+                              >
+                                {invSavingId === product._id ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                    Saving...
+                                  </>
+                                ) : (
+                                  <>
+                                    <Save className="w-4 h-4 mr-2" />
+                                    Update
+                                  </>
+                                )}
+                              </Button>
+                            </div>
+
+                            <div className="mt-2 text-xs text-gray-500">
+                              New availability will become:{" "}
+                              <span className="text-gray-300">
+                                {computeAvailability(
+                                  parseInt(invDraft[product._id].qty || "0", 10),
+                                  parseInt(invDraft[product._id].low || "5", 10),
+                                )}
+                              </span>
                             </div>
                           </div>
-
-                          <div className="mt-3 grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-3 items-end">
-                            <div>
-                              <Label className="text-gray-300">Quantity</Label>
-                              <Input
-                                type="number"
-                                min="0"
-                                value={draft.qty}
-                                onChange={(e) =>
-                                  setInvDraft((prev) => ({
-                                    ...prev,
-                                    [product._id]: {
-                                      ...prev[product._id],
-                                      qty: e.target.value,
-                                      low: prev[product._id]?.low ?? String(product.lowStockThreshold ?? 5),
-                                    },
-                                  }))
-                                }
-                                className="bg-gray-900 border-gray-700 text-white focus:border-yellow-500"
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-gray-300">Low Stock Threshold</Label>
-                              <Input
-                                type="number"
-                                min="0"
-                                value={draft.low}
-                                onChange={(e) =>
-                                  setInvDraft((prev) => ({
-                                    ...prev,
-                                    [product._id]: {
-                                      ...prev[product._id],
-                                      low: e.target.value,
-                                      qty: prev[product._id]?.qty ?? String(product.quantity ?? 0),
-                                    },
-                                  }))
-                                }
-                                className="bg-gray-900 border-gray-700 text-white focus:border-yellow-500"
-                              />
-                            </div>
-
-                            <Button
-                              onClick={() => saveInventory(product._id)}
-                              disabled={invSavingId === product._id}
-                              className="bg-yellow-500 hover:bg-yellow-600 text-black font-semibold"
-                            >
-                              {invSavingId === product._id ? (
-                                <>
-                                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                  Saving...
-                                </>
-                              ) : (
-                                <>
-                                  <Save className="w-4 h-4 mr-2" />
-                                  Update
-                                </>
-                              )}
-                            </Button>
-                          </div>
-
-                          <div className="mt-2 text-xs text-gray-500">
-                            New availability will become:{" "}
-                            <span className="text-gray-300">
-                              {computeAvailability(
-                                parseInt(draft.qty || "0", 10),
-                                parseInt(draft.low || "5", 10),
-                              )}
-                            </span>
-                          </div>
-                        </div>
+                        )}
 
                         <p className="text-sm text-gray-300 mt-4 line-clamp-2">
                           {product.description || "No description available"}
@@ -1776,7 +2219,7 @@ export default function Catalogue() {
 
         {/* View Modal */}
         <Dialog open={!!viewProduct} onOpenChange={() => setViewProduct(null)}>
-          <DialogContent className="max-w-3xl bg-gray-900 border-gray-800 text-white max-h-[80vh] overflow-y-auto">
+          <DialogContent className="max-w-4xl bg-gray-900 border-gray-800 text-white max-h-[80vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle className="text-yellow-400">
                 {viewProduct?.name}
@@ -1805,19 +2248,16 @@ export default function Catalogue() {
                         <p className="text-sm text-gray-400">
                           SKU: {viewProduct.sku || "N/A"}
                         </p>
+                        {viewProduct.hasVariants && (
+                          <Badge className="mt-2 bg-blue-900/30 text-blue-400 border border-blue-800">
+                            Product with Variants
+                          </Badge>
+                        )}
                       </div>
                       <Badge
-                        className={`${getAvailabilityColor(
-                          computeAvailability(
-                            viewProduct.quantity ?? 0,
-                            viewProduct.lowStockThreshold ?? 5,
-                          ),
-                        )} font-medium`}
+                        className={`${getAvailabilityColor(overallAvailability(viewProduct))} font-medium`}
                       >
-                        {computeAvailability(
-                          viewProduct.quantity ?? 0,
-                          viewProduct.lowStockThreshold ?? 5,
-                        )}
+                        {overallAvailability(viewProduct)}
                       </Badge>
                     </div>
 
@@ -1834,50 +2274,88 @@ export default function Catalogue() {
 
                     <div className="grid grid-cols-2 gap-4">
                       <div className="bg-gray-800 p-3 rounded-lg">
-                        <p className="text-sm text-gray-400 mb-1">Quantity</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.quantity ?? 0}
-                        </p>
+                        <p className="text-sm text-gray-400 mb-1">Total Stock</p>
+                        <p className="font-semibold text-white">{totalStock(viewProduct)}</p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
-                        <p className="text-sm text-gray-400 mb-1">Low Stock</p>
+                        <p className="text-sm text-gray-400 mb-1">Low Stock Threshold</p>
                         <p className="font-semibold text-white">
-                          {viewProduct.lowStockThreshold ?? 5}
+                          {viewProduct.hasVariants ? 'Per variant' : (viewProduct.lowStockThreshold ?? 5)}
                         </p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Colors</p>
-                        <p className="font-semibold text-white">
-                          {colorNames(viewProduct.color)}
-                        </p>
+                        <p className="font-semibold text-white">{colorNames(viewProduct.color)}</p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Sizes</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.size?.join(", ") || "N/A"}
-                        </p>
+                        <p className="font-semibold text-white">{viewProduct.size?.join(", ") || "N/A"}</p>
+                      </div>
+                      <div className="bg-gray-800 p-3 rounded-lg">
+                        <p className="text-sm text-gray-400 mb-1">Fabrics</p>
+                        <p className="font-semibold text-white">{fabricNames(viewProduct.fabricTypes)}</p>
+                      </div>
+                      <div className="bg-gray-800 p-3 rounded-lg">
+                        <p className="text-sm text-gray-400 mb-1">Extra Pillows</p>
+                        <p className="font-semibold text-white">{viewProduct.extraPillows ?? 0}</p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Material</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.material || "N/A"}
-                        </p>
+                        <p className="font-semibold text-white">{viewProduct.material || "N/A"}</p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Weight</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.weight || "N/A"}
-                        </p>
+                        <p className="font-semibold text-white">{viewProduct.weight || "N/A"}</p>
                       </div>
                       <div className="bg-gray-800 p-3 rounded-lg">
                         <p className="text-sm text-gray-400 mb-1">Location</p>
-                        <p className="font-semibold text-white">
-                          {viewProduct.location || "N/A"}
-                        </p>
+                        <p className="font-semibold text-white">{viewProduct.location || "N/A"}</p>
                       </div>
                     </div>
                   </div>
                 </div>
+
+                {/* Variants table if any */}
+                {viewProduct.variants && viewProduct.variants.length > 0 && (
+                  <div className="mt-4">
+                    <h4 className="font-semibold text-yellow-400 mb-3">Variants</h4>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm text-left">
+                        <thead className="text-xs text-gray-400 uppercase bg-gray-800/50">
+                          <tr>
+                            <th className="px-4 py-2">Size</th>
+                            <th className="px-4 py-2">Color</th>
+                            <th className="px-4 py-2">Fabric</th>
+                            <th className="px-4 py-2">SKU</th>
+                            <th className="px-4 py-2">Price</th>
+                            <th className="px-4 py-2">Quantity</th>
+                            <th className="px-4 py-2">Low Stock</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {viewProduct.variants.map((variant, idx) => (
+                            <tr key={idx} className="border-b border-gray-800">
+                              <td className="px-4 py-2">{variant.attributes.size || '-'}</td>
+                              <td className="px-4 py-2">
+                                {variant.attributes.color ? (
+                                  <div className="flex items-center gap-1">
+                                    <div className="w-4 h-4 rounded-full" style={{ backgroundColor: variant.attributes.color }} />
+                                    <span>{colors.find(c => c.value === variant.attributes.color)?.name || variant.attributes.color}</span>
+                                  </div>
+                                ) : '-'}
+                              </td>
+                              <td className="px-4 py-2">{fabrics.find(f => f.value === variant.attributes.fabric)?.name || variant.attributes.fabric || '-'}</td>
+                              <td className="px-4 py-2 font-mono text-xs">{variant.sku}</td>
+                              <td className="px-4 py-2">₹{variant.price}</td>
+                              <td className="px-4 py-2">{variant.quantity}</td>
+                              <td className="px-4 py-2">{variant.lowStockThreshold}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
 
                 {viewProduct.galleryImages?.length > 0 && (
                   <div>
@@ -1933,15 +2411,28 @@ export default function Catalogue() {
             }
           }}
         >
-          <DialogContent className="max-w-3xl bg-gray-900 border-gray-800 text-white max-h-[80vh] overflow-y-auto">
+          <DialogContent className="max-w-4xl bg-gray-900 border-gray-800 text-white max-h-[85vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle className="text-yellow-400">Edit Product</DialogTitle>
             </DialogHeader>
 
             {editProduct && (
               <div className="space-y-5">
+                {/* Variants toggle */}
+                <div className="flex items-center gap-3 p-3 bg-gray-800/50 rounded-lg">
+                  <Label className="text-gray-300 cursor-pointer flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={editEnableVariants}
+                      onChange={(e) => setEditEnableVariants(e.target.checked)}
+                      className="rounded border-gray-600"
+                    />
+                    <span>This product has variants</span>
+                  </Label>
+                </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Left */}
+                  {/* Left Column - Basic Info */}
                   <div className="space-y-3">
                     <div>
                       <Label className="text-gray-300">Product Name</Label>
@@ -1973,64 +2464,6 @@ export default function Catalogue() {
                       />
                     </div>
 
-                    {/* ✅ Inventory */}
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label className="text-gray-300">Quantity</Label>
-                        <Input
-                          type="number"
-                          min="0"
-                          value={editProduct.quantity ?? 0}
-                          onChange={(e) =>
-                            setEditProduct({
-                              ...editProduct,
-                              quantity: parseInt(e.target.value) || 0,
-                            })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
-                      <div>
-                        <Label className="text-gray-300">Low Stock Threshold</Label>
-                        <Input
-                          type="number"
-                          min="0"
-                          value={editProduct.lowStockThreshold ?? 5}
-                          onChange={(e) =>
-                            setEditProduct({
-                              ...editProduct,
-                              lowStockThreshold: parseInt(e.target.value) || 5,
-                            })
-                          }
-                          disabled={saving}
-                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-800/40 p-3">
-                      <div className="text-sm text-gray-300">
-                        Availability (auto)
-                        <div className="text-[11px] text-gray-500">
-                          Computed from quantity & threshold
-                        </div>
-                      </div>
-                      <Badge
-                        className={getAvailabilityColor(
-                          computeAvailability(
-                            editProduct.quantity ?? 0,
-                            editProduct.lowStockThreshold ?? 5,
-                          ),
-                        )}
-                      >
-                        {computeAvailability(
-                          editProduct.quantity ?? 0,
-                          editProduct.lowStockThreshold ?? 5,
-                        )}
-                      </Badge>
-                    </div>
-
                     {/* Parent Category */}
                     <div>
                       <Label className="text-gray-300">Parent Category</Label>
@@ -2040,7 +2473,6 @@ export default function Catalogue() {
                           const pid = e.target.value;
                           const subs = subsByParent.get(pid) || [];
                           const firstSub = subs[0];
-
                           setEditParentId(pid);
                           setEditSubId(firstSub?.id || "");
                         }}
@@ -2113,12 +2545,76 @@ export default function Catalogue() {
                     </div>
                   </div>
 
-                  {/* Right */}
+                  {/* Right Column - Attributes */}
                   <div className="space-y-3">
-                    {/* 👇 Color multi-select checkboxes for edit */}
+                    {/* Colors */}
                     <div>
                       <Label className="text-gray-300">Colors</Label>
-                      <div className="grid grid-cols-2 gap-2 mt-2">
+
+                      {/* Custom color input */}
+                      <div className="flex gap-2 mt-2">
+                        <Input
+                          placeholder="Enter color name or hex"
+                          value={editCustomColorInput}
+                          onChange={(e) => setEditCustomColorInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              setEditProduct(prev => prev ? {
+                                ...prev,
+                                color: addColorToArray(prev.color, editCustomColorInput)
+                              } : prev);
+                              setEditCustomColorInput('');
+                            }
+                          }}
+                          className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                        />
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            setEditProduct(prev => prev ? {
+                              ...prev,
+                              color: addColorToArray(prev.color, editCustomColorInput)
+                            } : prev);
+                            setEditCustomColorInput('');
+                          }}
+                          className="bg-yellow-500 hover:bg-yellow-600 text-black"
+                          size="sm"
+                        >
+                          Add
+                        </Button>
+                      </div>
+
+                      {/* Selected colors as tags */}
+                      {editProduct.color && editProduct.color.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-3">
+                          {editProduct.color.map((color, idx) => (
+                            <span
+                              key={idx}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-gray-700 text-white"
+                            >
+                              <span
+                                className="w-3 h-3 rounded-full"
+                                style={{ backgroundColor: color }}
+                              />
+                              {color}
+                              <button
+                                type="button"
+                                onClick={() => setEditProduct(prev => prev ? {
+                                  ...prev,
+                                  color: prev.color.filter((_, i) => i !== idx)
+                                } : prev)}
+                                className="ml-1 text-gray-400 hover:text-white"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Predefined color checkboxes */}
+                      <div className="grid grid-cols-2 gap-2 mt-3">
                         {colors.map((colorOption) => {
                           const isSelected = editProduct.color?.includes(colorOption.value) || false;
                           return (
@@ -2140,7 +2636,7 @@ export default function Catalogue() {
                                     setEditProduct((prev) =>
                                       prev ? {
                                         ...prev,
-                                        color: [...(prev.color || []), colorOption.value],
+                                        color: addColorToArray(prev.color, colorOption.value),
                                       } : prev
                                     );
                                   } else {
@@ -2163,24 +2659,9 @@ export default function Catalogue() {
                           );
                         })}
                       </div>
-                      <p className="text-xs text-gray-400 mt-1">
-                        Selected: {editProduct.color?.length || 0} color(s)
-                      </p>
                     </div>
 
-                    <div>
-                      <Label className="text-gray-300">Material</Label>
-                      <Input
-                        value={editProduct.material}
-                        onChange={(e) =>
-                          setEditProduct({ ...editProduct, material: e.target.value })
-                        }
-                        disabled={saving}
-                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
-                      />
-                    </div>
-
-                    {/* 👇 Size input (comma-separated) */}
+                    {/* Sizes */}
                     <div>
                       <Label className="text-gray-300">Sizes (comma separated)</Label>
                       <Input
@@ -2195,9 +2676,82 @@ export default function Catalogue() {
                         disabled={saving}
                         className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
                       />
-                      <p className="text-xs text-gray-400 mt-1">
-                        Enter sizes separated by commas
-                      </p>
+                    </div>
+
+                    {/* Fabric Types */}
+                    <div>
+                      <Label className="text-gray-300">Fabric Types</Label>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        {fabrics.map((fabric) => {
+                          const isSelected = editProduct.fabricTypes?.includes(fabric.value) || false;
+                          return (
+                            <label
+                              key={fabric.value}
+                              className={cn(
+                                "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+                                isSelected
+                                  ? "border-yellow-500 bg-yellow-500/10"
+                                  : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+                              )}
+                            >
+                              <input
+                                type="checkbox"
+                                className="sr-only"
+                                checked={isSelected}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setEditProduct((prev) =>
+                                      prev ? {
+                                        ...prev,
+                                        fabricTypes: [...(prev.fabricTypes || []), fabric.value],
+                                      } : prev
+                                    );
+                                  } else {
+                                    setEditProduct((prev) =>
+                                      prev ? {
+                                        ...prev,
+                                        fabricTypes: (prev.fabricTypes || []).filter(f => f !== fabric.value),
+                                      } : prev
+                                    );
+                                  }
+                                }}
+                              />
+                              <span className="text-sm text-white">{fabric.name}</span>
+                              {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Extra Pillows */}
+                    <div>
+                      <Label className="text-gray-300">Extra Pillows Included</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        value={editProduct.extraPillows ?? 0}
+                        onChange={(e) =>
+                          setEditProduct({
+                            ...editProduct,
+                            extraPillows: parseInt(e.target.value) || 0,
+                          })
+                        }
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
+                    </div>
+
+                    <div>
+                      <Label className="text-gray-300">Material</Label>
+                      <Input
+                        value={editProduct.material}
+                        onChange={(e) =>
+                          setEditProduct({ ...editProduct, material: e.target.value })
+                        }
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
                     </div>
 
                     <div className="grid grid-cols-2 gap-3">
@@ -2240,7 +2794,6 @@ export default function Catalogue() {
                     {/* Main Image */}
                     <div className="mt-2">
                       <Label className="text-gray-300">Main Image</Label>
-
                       <div className="mt-2 rounded-lg overflow-hidden border border-gray-700 bg-gray-800">
                         <img
                           src={editMainPreview || editProduct.image}
@@ -2248,7 +2801,6 @@ export default function Catalogue() {
                           className="w-full h-40 object-cover"
                         />
                       </div>
-
                       <Input
                         type="file"
                         accept="image/*"
@@ -2259,6 +2811,140 @@ export default function Catalogue() {
                     </div>
                   </div>
                 </div>
+
+                {/* Variants editing (if enabled) */}
+                {editEnableVariants && (
+                  <div className="border-t border-gray-800 pt-4">
+                    <h3 className="text-yellow-400 font-semibold mb-3">Edit Variants</h3>
+                    <p className="text-xs text-gray-400 mb-2">
+                      Modify existing variants or add new ones by changing attribute selections below. New combinations will be added automatically.
+                    </p>
+                    {editVariants.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left">
+                          <thead className="text-xs text-gray-400 uppercase bg-gray-800/50">
+                            <tr>
+                              <th className="px-4 py-2">Size</th>
+                              <th className="px-4 py-2">Color</th>
+                              <th className="px-4 py-2">Fabric</th>
+                              <th className="px-4 py-2">SKU</th>
+                              <th className="px-4 py-2">Price</th>
+                              <th className="px-4 py-2">Quantity</th>
+                              <th className="px-4 py-2">Low Stock</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {editVariants.map((variant, idx) => (
+                              <tr key={idx} className="border-b border-gray-800">
+                                <td className="px-4 py-2">{variant.attributes.size || '-'}</td>
+                                <td className="px-4 py-2">
+                                  {variant.attributes.color ? (
+                                    <div className="flex items-center gap-1">
+                                      <div className="w-4 h-4 rounded-full" style={{ backgroundColor: variant.attributes.color }} />
+                                      <span>{colors.find(c => c.value === variant.attributes.color)?.name || variant.attributes.color}</span>
+                                    </div>
+                                  ) : '-'}
+                                </td>
+                                <td className="px-4 py-2">{fabrics.find(f => f.value === variant.attributes.fabric)?.name || variant.attributes.fabric || '-'}</td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    value={variant.sku}
+                                    onChange={(e) => {
+                                      const newVariants = [...editVariants];
+                                      newVariants[idx].sku = e.target.value.toUpperCase();
+                                      setEditVariants(newVariants);
+                                    }}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    step="0.01"
+                                    value={variant.price}
+                                    onChange={(e) => {
+                                      const newVariants = [...editVariants];
+                                      newVariants[idx].price = parseFloat(e.target.value) || 0;
+                                      setEditVariants(newVariants);
+                                    }}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-24"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    value={variant.quantity}
+                                    onChange={(e) => {
+                                      const newVariants = [...editVariants];
+                                      newVariants[idx].quantity = parseInt(e.target.value) || 0;
+                                      setEditVariants(newVariants);
+                                    }}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-20"
+                                  />
+                                </td>
+                                <td className="px-4 py-2">
+                                  <Input
+                                    type="number"
+                                    min="0"
+                                    value={variant.lowStockThreshold}
+                                    onChange={(e) => {
+                                      const newVariants = [...editVariants];
+                                      newVariants[idx].lowStockThreshold = parseInt(e.target.value) || 5;
+                                      setEditVariants(newVariants);
+                                    }}
+                                    className="bg-gray-800 border-gray-700 text-white h-8 text-xs w-20"
+                                  />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="text-gray-400">No variants yet. Toggle variants on and save to generate from current attributes.</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Simple product inventory fields (if variants not enabled) */}
+                {!editEnableVariants && (
+                  <div className="grid grid-cols-2 gap-4 mt-4">
+                    <div>
+                      <Label className="text-gray-300">Quantity</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        value={editProduct.quantity ?? 0}
+                        onChange={(e) =>
+                          setEditProduct({
+                            ...editProduct,
+                            quantity: parseInt(e.target.value) || 0,
+                          })
+                        }
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-gray-300">Low Stock Threshold</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        value={editProduct.lowStockThreshold ?? 5}
+                        onChange={(e) =>
+                          setEditProduct({
+                            ...editProduct,
+                            lowStockThreshold: parseInt(e.target.value) || 5,
+                          })
+                        }
+                        disabled={saving}
+                        className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+                      />
+                    </div>
+                  </div>
+                )}
 
                 {/* Existing gallery */}
                 <div className="border-t border-gray-800 pt-4">
