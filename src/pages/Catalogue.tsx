@@ -40,7 +40,7 @@ import { cn } from "@/lib/utils";
 // TYPES
 // ----------------------------------------------------------------------
 interface ProductVariant {
-  _id?: string;                      // existing variant id (if any)
+  _id?: string;                    
   attributes: {
     size?: string;
     color?: string;
