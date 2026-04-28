@@ -269,7 +269,8 @@ export default function Catalogue() {
   const [products, setProducts] = useState<Product[]>([]);
   const [filteredProducts, setFilteredProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
-
+const [customFabricInput, setCustomFabricInput] = useState("");
+const [editCustomFabricInput, setEditCustomFabricInput] = useState("");
   const [viewProduct, setViewProduct] = useState<Product | null>(null);
   const [editProduct, setEditProduct] = useState<Product | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -320,7 +321,21 @@ export default function Catalogue() {
       setCatLoading(false);
     }
   };
+const addFabricToArray = (
+  currentFabrics: string[] = [],
+  newFabric: string
+): string[] => {
+  const trimmed = newFabric.trim().toLowerCase();
+  if (!trimmed) return currentFabrics;
+  if (currentFabrics.includes(trimmed)) return currentFabrics;
+  return [...currentFabrics, trimmed];
+};
 
+const parseSizeString = (value: string): string[] => {
+  return value
+    ? value.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
+};
   const parentCategories = useMemo(() => {
     return categoryNodes
       .filter((c) => !c.parentId)
@@ -950,25 +965,28 @@ export default function Catalogue() {
 
       // Build product data
       const productData: any = {
-        name: newProduct.name,
-        categoryId: parent?.id,
-        subCategoryId: sub?.id || null,
-        category: parent?.slug,
-        subcategory: sub?.slug || "",
-        sku: newProduct.sku,
-        shortDescription: newProduct.shortDescription,
-        description: newProduct.description,
-        price: parseFloat(newProduct.price),
-        color: newProduct.color,
-        material: newProduct.material,
-        weight: newProduct.weight,
-        location: newProduct.location,
-        deliveryTime: newProduct.deliveryTime,
-        image: mainImageUrl,
-        galleryImages: galleryUrls,
-        fabricTypes: newProduct.fabricTypes,
-        extraPillows: newProduct.extraPillows ? parseInt(newProduct.extraPillows, 10) : 0,
-      };
+  name: newProduct.name,
+  categoryId: parent?.id,
+  subCategoryId: sub?.id || null,
+  category: parent?.slug,
+  subcategory: sub?.slug || "",
+  sku: newProduct.sku,
+  shortDescription: newProduct.shortDescription,
+  description: newProduct.description,
+  price: parseFloat(newProduct.price),
+  color: newProduct.color,
+  size: parseSizeString(newProduct.size),
+  material: newProduct.material,
+  weight: newProduct.weight,
+  location: newProduct.location,
+  deliveryTime: newProduct.deliveryTime,
+  image: mainImageUrl,
+  galleryImages: galleryUrls,
+  fabricTypes: newProduct.fabricTypes,
+  extraPillows: newProduct.extraPillows
+    ? parseInt(newProduct.extraPillows, 10)
+    : 0,
+};
 
       if (newProduct.enableVariants) {
         // For variant product, send variants array; simple product fields (quantity, lowStockThreshold) are ignored by backend
@@ -1131,28 +1149,32 @@ export default function Catalogue() {
       const parentNode = editParentId ? categoryById.get(editParentId) : undefined;
       const subNode = editSubId ? categoryById.get(editSubId) : undefined;
 
-      const updateData: any = {
-        name: editProduct.name,
-        categoryId: parentNode?.id,
-        subCategoryId: subNode?.id || null,
-        category: parentNode?.slug,
-        subcategory: subNode?.slug || "",
-        sku: editProduct.sku,
-        shortDescription: editProduct.shortDescription,
-        description: editProduct.description,
-        price: editProduct.price,
-        color: editProduct.color,
-        material: editProduct.material,
-        weight: editProduct.weight,
-        location: editProduct.location,
-        deliveryTime: editProduct.deliveryTime,
-        image: mainImageUrl,
-        galleryImages: finalGallery,
-        fabricTypes: editProduct.fabricTypes,
-        extraPillows: editProduct.extraPillows,
-        hasVariants: editEnableVariants,
-      };
-
+const updateData: any = {
+  name: editProduct.name,
+  categoryId: parentNode?.id,
+  subCategoryId: subNode?.id || null,
+  category: parentNode?.slug,
+  subcategory: subNode?.slug || "",
+  sku: editProduct.sku,
+  shortDescription: editProduct.shortDescription,
+  description: editProduct.description,
+  price: editProduct.price,
+  color: editProduct.color,
+  size: Array.isArray(editProduct.size)
+    ? editProduct.size
+    : editProduct.size
+    ? [editProduct.size]
+    : [],
+  material: editProduct.material,
+  weight: editProduct.weight,
+  location: editProduct.location,
+  deliveryTime: editProduct.deliveryTime,
+  image: mainImageUrl,
+  galleryImages: finalGallery,
+  fabricTypes: editProduct.fabricTypes || [],
+  extraPillows: editProduct.extraPillows || 0,
+  hasVariants: editEnableVariants,
+};
       if (editEnableVariants) {
         updateData.variants = editVariants.map(v => ({
           ...v,
@@ -1627,46 +1649,114 @@ export default function Catalogue() {
 
                       {/* Fabric Types (NEW) */}
                       <div>
-                        <Label className="text-gray-300">Fabric Types</Label>
-                        <div className="grid grid-cols-2 gap-2 mt-2">
-                          {fabrics.map((fabric) => {
-                            const isSelected = newProduct.fabricTypes.includes(fabric.value);
-                            return (
-                              <label
-                                key={fabric.value}
-                                className={cn(
-                                  "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
-                                  isSelected
-                                    ? "border-yellow-500 bg-yellow-500/10"
-                                    : "border-gray-700 bg-gray-800 hover:bg-gray-700"
-                                )}
-                              >
-                                <input
-                                  type="checkbox"
-                                  className="sr-only"
-                                  checked={isSelected}
-                                  onChange={(e) => {
-                                    if (e.target.checked) {
-                                      setNewProduct((prev) => ({
-                                        ...prev,
-                                        fabricTypes: [...prev.fabricTypes, fabric.value],
-                                      }));
-                                    } else {
-                                      setNewProduct((prev) => ({
-                                        ...prev,
-                                        fabricTypes: prev.fabricTypes.filter(f => f !== fabric.value),
-                                      }));
-                                    }
-                                  }}
-                                />
-                                <span className="text-sm text-white">{fabric.name}</span>
-                                {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </div>
+  <Label className="text-gray-300">Fabric Types / Add-On Options</Label>
 
+  <div className="flex gap-2 mt-2">
+    <Input
+      placeholder="Add fabric or add-on e.g. Rexine, Cushion Add-On"
+      value={customFabricInput}
+      onChange={(e) => setCustomFabricInput(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          setNewProduct((prev) => ({
+            ...prev,
+            fabricTypes: addFabricToArray(
+              prev.fabricTypes,
+              customFabricInput
+            ),
+          }));
+          setCustomFabricInput("");
+        }
+      }}
+      className="bg-gray-800 border-gray-700 text-white focus:border-yellow-500"
+    />
+
+    <Button
+      type="button"
+      onClick={() => {
+        setNewProduct((prev) => ({
+          ...prev,
+          fabricTypes: addFabricToArray(prev.fabricTypes, customFabricInput),
+        }));
+        setCustomFabricInput("");
+      }}
+      className="bg-yellow-500 hover:bg-yellow-600 text-black"
+      size="sm"
+    >
+      Add
+    </Button>
+  </div>
+
+  {newProduct.fabricTypes.length > 0 && (
+    <div className="flex flex-wrap gap-2 mt-3">
+      {newProduct.fabricTypes.map((fabric, idx) => (
+        <span
+          key={idx}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-gray-700 text-white"
+        >
+          {fabric}
+          <button
+            type="button"
+            onClick={() =>
+              setNewProduct((prev) => ({
+                ...prev,
+                fabricTypes: prev.fabricTypes.filter((_, i) => i !== idx),
+              }))
+            }
+            className="ml-1 text-gray-400 hover:text-white"
+          >
+            ×
+          </button>
+        </span>
+      ))}
+    </div>
+  )}
+
+  <div className="grid grid-cols-2 gap-2 mt-3">
+    {fabrics.map((fabric) => {
+      const isSelected = newProduct.fabricTypes.includes(fabric.value);
+
+      return (
+        <label
+          key={fabric.value}
+          className={cn(
+            "flex items-center gap-2 p-2 rounded-md border cursor-pointer transition-colors",
+            isSelected
+              ? "border-yellow-500 bg-yellow-500/10"
+              : "border-gray-700 bg-gray-800 hover:bg-gray-700"
+          )}
+        >
+          <input
+            type="checkbox"
+            className="sr-only"
+            checked={isSelected}
+            onChange={(e) => {
+              if (e.target.checked) {
+                setNewProduct((prev) => ({
+                  ...prev,
+                  fabricTypes: addFabricToArray(
+                    prev.fabricTypes,
+                    fabric.value
+                  ),
+                }));
+              } else {
+                setNewProduct((prev) => ({
+                  ...prev,
+                  fabricTypes: prev.fabricTypes.filter(
+                    (f) => f !== fabric.value
+                  ),
+                }));
+              }
+            }}
+          />
+          <span className="text-sm text-white">{fabric.name}</span>
+          {isSelected && <Check className="w-4 h-4 ml-auto text-yellow-400" />}
+        </label>
+      );
+    })}
+  </div>
+</div>
                       {/* Extra Pillows (NEW) */}
                       <div>
                         <Label className="text-gray-300">Extra Pillows Included</Label>
