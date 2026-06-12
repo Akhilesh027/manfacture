@@ -98,9 +98,11 @@ interface Product {
 
 type CategoryNode = {
   id: string;
+  _id?: string;
   name: string;
   slug: string;
   parentId?: string | null;
+  parent?: string | null;
   segment?: string;
 };
 
@@ -149,7 +151,7 @@ const fabricNames = (fabricArray?: string[]) => {
 };
 
 // ✅ inventory-safe availability (for simple products)
-const computeAvailability = (qty: number, low = 5) => {
+const computeAvailability = (qty: number, low = 5): Product["availability"] => {
   const q = Number.isFinite(qty) ? qty : 0;
   const l = Number.isFinite(low) ? low : 5;
   if (q <= 0) return "Out of Stock";
@@ -166,7 +168,7 @@ const totalStock = (product: Product): number => {
 };
 
 // compute overall availability based on total stock
-const overallAvailability = (product: Product): string => {
+const overallAvailability = (product: Product): Product["availability"] => {
   if (product.variants && product.variants.length > 0) {
     const total = totalStock(product);
     const anyLow = product.variants.some(v => v.quantity <= (v.lowStockThreshold ?? 5));
@@ -262,6 +264,70 @@ function safeItemsFromCategoryResponse(res: any): CategoryNode[] {
   return Array.isArray(items) ? items : [];
 }
 
+const getCategoryRawId = (category: any): string =>
+  String(category?.id || category?._id || category?.value || "").trim();
+
+const getCategoryParentId = (category: any): string | null => {
+  const parent =
+    category?.parentId ||
+    category?.parent ||
+    category?.parentCategoryId ||
+    category?.parentCategory ||
+    null;
+
+  if (!parent) return null;
+  if (typeof parent === "object") return getCategoryRawId(parent) || null;
+  return String(parent).trim() || null;
+};
+
+const makeCategoryDedupeKey = (category: CategoryNode): string => {
+  const parentKey = category.parentId ? category.parentId : "root";
+  const slugOrName = (category.slug || category.name || category.id).trim().toLowerCase();
+  return `${parentKey}::${slugOrName}`;
+};
+
+const normalizeCategoryNodes = (items: any[]): CategoryNode[] => {
+  const normalized = items
+    .map((item) => {
+      const id = getCategoryRawId(item);
+      if (!id) return null;
+
+      return {
+        ...item,
+        id,
+        _id: item?._id ? String(item._id) : undefined,
+        name: String(item?.name || item?.title || "Untitled Category").trim(),
+        slug: String(item?.slug || item?.name || id).trim(),
+        parentId: getCategoryParentId(item),
+      } as CategoryNode;
+    })
+    .filter(Boolean) as CategoryNode[];
+
+  const aliasByDuplicateId = new Map<string, string>();
+  const firstIdByRootKey = new Map<string, string>();
+
+  normalized.forEach((category) => {
+    if (category.parentId) return;
+    const key = (category.slug || category.name || category.id).trim().toLowerCase();
+    const existingId = firstIdByRootKey.get(key);
+    if (existingId && existingId !== category.id) aliasByDuplicateId.set(category.id, existingId);
+    else firstIdByRootKey.set(key, category.id);
+  });
+
+  const remapped = normalized.map((category) => ({
+    ...category,
+    parentId: category.parentId ? aliasByDuplicateId.get(category.parentId) || category.parentId : null,
+  }));
+
+  const unique = new Map<string, CategoryNode>();
+  remapped.forEach((category) => {
+    const key = makeCategoryDedupeKey(category);
+    if (!unique.has(key)) unique.set(key, category);
+  });
+
+  return Array.from(unique.values());
+};
+
 // ----------------------------------------------------------------------
 // MAIN COMPONENT
 // ----------------------------------------------------------------------
@@ -310,7 +376,7 @@ const [editCustomFabricInput, setEditCustomFabricInput] = useState("");
     try {
       setCatLoading(true);
       const res = await apiRequest("GET", "/api/admin/categories?limit=500");
-      setCategoryNodes(safeItemsFromCategoryResponse(res));
+      setCategoryNodes(normalizeCategoryNodes(safeItemsFromCategoryResponse(res)));
     } catch (e: any) {
       toast({
         title: "Category fetch failed",
@@ -337,18 +403,35 @@ const parseSizeString = (value: string): string[] => {
     : [];
 };
   const parentCategories = useMemo(() => {
-    return categoryNodes
+    const unique = new Map<string, CategoryNode>();
+
+    categoryNodes
       .filter((c) => !c.parentId)
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .forEach((c) => {
+        const key = (c.slug || c.name || c.id).trim().toLowerCase();
+        if (!unique.has(key)) unique.set(key, c);
+      });
+
+    return Array.from(unique.values()).sort((a, b) => a.name.localeCompare(b.name));
   }, [categoryNodes]);
 
   const subsByParent = useMemo(() => {
     const map = new Map<string, CategoryNode[]>();
+
     categoryNodes.forEach((c) => {
       if (!c.parentId) return;
       if (!map.has(c.parentId)) map.set(c.parentId, []);
-      map.get(c.parentId)!.push(c);
+
+      const currentSubs = map.get(c.parentId)!;
+      const duplicate = currentSubs.some(
+        (existing) =>
+          (existing.slug || existing.name || existing.id).trim().toLowerCase() ===
+          (c.slug || c.name || c.id).trim().toLowerCase(),
+      );
+
+      if (!duplicate) currentSubs.push(c);
     });
+
     for (const [k, arr] of map.entries()) {
       arr.sort((a, b) => a.name.localeCompare(b.name));
       map.set(k, arr);
@@ -1147,7 +1230,22 @@ const parseSizeString = (value: string): string[] => {
       }
 
       const parentNode = editParentId ? categoryById.get(editParentId) : undefined;
-      const subNode = editSubId ? categoryById.get(editSubId) : undefined;
+      const validEditSubs = editParentId ? subsByParent.get(editParentId) || [] : [];
+      const isValidEditSub = editSubId
+        ? validEditSubs.some((s) => s.id === editSubId)
+        : true;
+      const subNode = isValidEditSub && editSubId ? categoryById.get(editSubId) : undefined;
+
+      if (editSubId && !isValidEditSub) {
+        setEditSubId("");
+        toast({
+          title: "Sub category reset",
+          description: "Selected sub category does not belong to the selected parent category. Please choose again.",
+          variant: "destructive",
+        });
+        setSaving(false);
+        return;
+      }
 
 const updateData: any = {
   name: editProduct.name,
